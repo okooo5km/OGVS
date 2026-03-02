@@ -1,0 +1,72 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Build output
+/svgo
+/bin/
+/dist/
+/build/
+
+# Go build cache
+/.gocache/
+
+# Local docs (keep untracked)
+/docs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# AI tool artifacts
+.claude/
+claude_*
+*.claude
+CLAUDE.md
+AGENTS.md
+.cursor/
+.aider*
+aider*.md
+.anthropic/
+.openai/
+
+# Temporary files and test directories
+*.tmp
+*.temp
+/tmp/
+/temp_test/
+# 临时测试文件目录（保留本地调试，但不纳入版本管理）
+
+# Go build/cache directories
+.gocache/
+.gomodcache/
+
+# Logs
+*.log
+
+# Test fixtures output
+/test/output/

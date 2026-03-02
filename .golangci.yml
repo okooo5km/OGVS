@@ -1,0 +1,54 @@
+version: "2"
+output:
+  formats:
+    text:
+      path: stdout
+  sort-order:
+    - file
+linters:
+  enable:
+    - misspell
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - unused
+        path: _test\.go
+      # Suppress staticcheck quick-fix suggestions (QF/ST/S1009/SA9003)
+      # This is a SVGO port — keeping logic close to the JS original is more important
+      - linters:
+          - staticcheck
+        text: "^(QF|ST)"
+      - linters:
+          - staticcheck
+        text: "S1009"
+      - linters:
+          - staticcheck
+        text: "SA9003"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/okooo5km/ogvs
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

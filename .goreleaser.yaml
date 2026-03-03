@@ -34,12 +34,33 @@ checksum:
   name_template: "checksums.txt"
 
 changelog:
+  use: github
   sort: asc
+  abbrev: -1
+  groups:
+    - title: "🚀 Features"
+      regexp: '^.*?feat(\([^)]*\))?!?:.*$'
+      order: 0
+    - title: "🐛 Bug Fixes"
+      regexp: '^.*?fix(\([^)]*\))?!?:.*$'
+      order: 1
+    - title: "⚡ Performance"
+      regexp: '^.*?perf(\([^)]*\))?!?:.*$'
+      order: 2
+    - title: "♻️ Refactor"
+      regexp: '^.*?refactor(\([^)]*\))?!?:.*$'
+      order: 3
+    - title: "📦 Build & CI"
+      regexp: '^.*?(build|ci)(\([^)]*\))?!?:.*$'
+      order: 4
+    - title: "🧹 Others"
+      order: 999
   filters:
     exclude:
       - "^docs:"
       - "^test:"
       - "^chore:"
+      - "^Merge"
 
 brews:
   - repository:
@@ -59,3 +80,11 @@ release:
   github:
     owner: okooo5km
     name: ogvs
+  name_template: "OGVS v{{ .Version }}"
+  header: |
+    ## OGVS v{{ .Version }}
+
+    [Full Changelog](https://github.com/okooo5km/ogvs/compare/{{ .PreviousTag }}...{{ .Tag }})
+  footer: |
+    ---
+    **Installation:** `brew install okooo5km/tap/ogvs` or `go install github.com/okooo5km/ogvs/cmd/ogvs@{{ .Tag }}`

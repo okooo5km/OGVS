@@ -15,6 +15,9 @@ make lint         # Run golangci-lint
 make fmt          # Format code
 make vet          # Run go vet
 make clean        # Remove build artifacts
+
+goreleaser check                    # Validate .goreleaser.yaml
+goreleaser release --snapshot --clean  # Local dry-run (preview changelog + artifacts)
 ```
 
 ## Module Layout
@@ -43,6 +46,67 @@ internal/
 - **Go version**: 1.24+
 - **TDD**: All features must be validated against SVGO test fixtures
 - **Golden standard**: SVGO fixture files at `/Users/5km/Dev/Web/svgo/test/plugins/`
+- **Commits**: Conventional Commits format (see below)
+
+## Commit Convention
+
+All commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+```
+type(scope): description
+```
+
+| Type | Usage | Release Changelog |
+|------|-------|-------------------|
+| `feat` | New feature | 🚀 Features |
+| `fix` | Bug fix | 🐛 Bug Fixes |
+| `perf` | Performance improvement | ⚡ Performance |
+| `refactor` | Code refactoring (no behavior change) | ♻️ Refactor |
+| `build` | Build system / dependencies | 📦 Build & CI |
+| `ci` | CI/CD changes | 📦 Build & CI |
+| `docs` | Documentation only | Excluded from changelog |
+| `test` | Tests only | Excluded from changelog |
+| `chore` | Maintenance / housekeeping | Excluded from changelog |
+
+Scope is optional: `feat(css): add custom property support` or `fix: handle empty input`.
+
+Breaking changes: append `!` after type — `feat!: redesign plugin API`.
+
+## Release Process
+
+Version source: `internal/version/version.go` (single source of truth).
+
+Steps to release a new version:
+
+```bash
+# 1. Update version constant
+#    Edit internal/version/version.go → const Version = "X.Y.Z"
+
+# 2. Commit with chore type (excluded from changelog)
+git commit -m "chore: bump version to vX.Y.Z"
+
+# 3. Validate goreleaser config
+goreleaser check
+
+# 4. Optional: local dry-run to preview changelog and artifacts
+goreleaser release --snapshot --clean
+
+# 5. Tag and push
+git tag vX.Y.Z
+git push origin main --tags
+
+# 6. GitHub Actions runs goreleaser automatically
+#    → builds multi-platform binaries (linux/darwin/windows × amd64/arm64)
+#    → creates GitHub Release with grouped changelog
+#    → updates Homebrew tap (okooo5km/homebrew-tap)
+```
+
+Key config files:
+- `.goreleaser.yaml` — build targets, changelog groups, Homebrew tap, release header/footer
+- `.github/workflows/release.yml` — CI trigger on `v*` tags
+
+Changelog is auto-generated from commits between tags, grouped by Conventional Commits type.
+Commits with `docs:`, `test:`, `chore:`, and `Merge` prefixes are excluded.
 
 ## SVGO Source Reference
 
@@ -153,6 +217,6 @@ go test -v -run TestRemoveComments ./internal/plugins/removecomments/
 - **Phase 13**: Open-source release preparation ✅
   - LICENSE: MIT license file
   - README.md: Full rewrite with badges, installation (Homebrew/go install/releases), CLI usage, config examples, all 53 plugins listed, API usage, known differences
-  - .goreleaser.yaml: Multi-platform builds (linux/darwin/windows × amd64/arm64), Homebrew tap (okooo5km/homebrew-tap), checksums, changelog
+  - .goreleaser.yaml: Multi-platform builds (linux/darwin/windows × amd64/arm64), Homebrew tap (okooo5km/homebrew-tap), checksums, changelog (Conventional Commits groups)
   - Version: 0.1.0-dev → 0.1.0
   - Cleanup: removed .temp_convert.log, GO_REWRITE_BLUEPRINT.md, hardcoded SVGO_FIXTURES path from Makefile

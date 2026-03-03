@@ -59,6 +59,13 @@ func ParseStyleDeclarations(cssText string) []StylesheetDeclaration {
 				})
 			}
 		}
+
+		if gt == css.CustomPropertyGrammar {
+			decl := parseCustomProperty(string(data), p.Values())
+			if decl.Name != "" {
+				declarations = append(declarations, decl)
+			}
+		}
 	}
 
 	return declarations
@@ -179,6 +186,13 @@ func parseRuleDeclarations(p *css.Parser) []StylesheetDeclaration {
 				Important: important,
 			})
 		}
+
+		if gt == css.CustomPropertyGrammar {
+			decl := parseCustomProperty(string(data), p.Values())
+			if decl.Name != "" {
+				declarations = append(declarations, decl)
+			}
+		}
 	}
 
 	return declarations
@@ -225,6 +239,29 @@ func parseAtRuleBlock(p *css.Parser, dynamic bool) []StylesheetRule {
 	}
 
 	return rules
+}
+
+// parseCustomProperty parses a CSS custom property (--*) from its name and value tokens.
+// Custom properties use CustomPropertyGrammar in tdewolff's parser, which returns
+// CustomPropertyValueToken with raw text (including leading whitespace).
+func parseCustomProperty(name string, values []css.Token) StylesheetDeclaration {
+	var rawValue string
+	for _, val := range values {
+		rawValue += string(val.Data)
+	}
+	rawValue = strings.TrimSpace(rawValue)
+
+	important := false
+	if idx := strings.LastIndex(strings.ToLower(rawValue), "!important"); idx >= 0 {
+		important = true
+		rawValue = strings.TrimSpace(rawValue[:idx])
+	}
+
+	return StylesheetDeclaration{
+		Name:      name,
+		Value:     rawValue,
+		Important: important,
+	}
 }
 
 // buildAtRuleMediaQuery builds a media query string from an at-rule name and prelude values.

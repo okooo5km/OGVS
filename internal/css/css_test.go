@@ -276,6 +276,96 @@ func TestComputeOwnStyle(t *testing.T) {
 	}
 }
 
+func TestParseStyleDeclarations_CustomProperties(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []StylesheetDeclaration
+	}{
+		{
+			name:  "single custom property",
+			input: "--bg: #fff",
+			want: []StylesheetDeclaration{
+				{Name: "--bg", Value: "#fff", Important: false},
+			},
+		},
+		{
+			name:  "custom property with var()",
+			input: "--_text: var(--fg)",
+			want: []StylesheetDeclaration{
+				{Name: "--_text", Value: "var(--fg)", Important: false},
+			},
+		},
+		{
+			name:  "custom property with !important",
+			input: "--color: red !important",
+			want: []StylesheetDeclaration{
+				{Name: "--color", Value: "red", Important: true},
+			},
+		},
+		{
+			name:  "mixed standard and custom properties",
+			input: "fill: red; --bg: #000; stroke: blue; --fg: #fff",
+			want: []StylesheetDeclaration{
+				{Name: "fill", Value: "red", Important: false},
+				{Name: "--bg", Value: "#000", Important: false},
+				{Name: "stroke", Value: "blue", Important: false},
+				{Name: "--fg", Value: "#fff", Important: false},
+			},
+		},
+		{
+			name:  "custom property with complex value",
+			input: "--gradient: linear-gradient(to right, #000, #fff)",
+			want: []StylesheetDeclaration{
+				{Name: "--gradient", Value: "linear-gradient(to right, #000, #fff)", Important: false},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseStyleDeclarations(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d declarations, want %d\ngot: %+v", len(got), len(tt.want), got)
+			}
+			for i, d := range got {
+				w := tt.want[i]
+				if d.Name != w.Name || d.Value != w.Value || d.Important != w.Important {
+					t.Errorf("decl[%d]: got {%q, %q, %v}, want {%q, %q, %v}",
+						i, d.Name, d.Value, d.Important, w.Name, w.Value, w.Important)
+				}
+			}
+		})
+	}
+}
+
+func TestParseStylesheet_CustomProperties(t *testing.T) {
+	cssText := `svg { --bg: #fff; --fg: #000; fill: var(--fg); }`
+	rules := ParseStylesheet(cssText, false)
+
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+
+	rule := rules[0]
+	if len(rule.Declarations) != 3 {
+		t.Fatalf("expected 3 declarations, got %d: %+v", len(rule.Declarations), rule.Declarations)
+	}
+
+	// --bg
+	if rule.Declarations[0].Name != "--bg" || rule.Declarations[0].Value != "#fff" {
+		t.Errorf("decl[0]: got {%q, %q}, want {--bg, #fff}", rule.Declarations[0].Name, rule.Declarations[0].Value)
+	}
+	// --fg
+	if rule.Declarations[1].Name != "--fg" || rule.Declarations[1].Value != "#000" {
+		t.Errorf("decl[1]: got {%q, %q}, want {--fg, #000}", rule.Declarations[1].Name, rule.Declarations[1].Value)
+	}
+	// fill
+	if rule.Declarations[2].Name != "fill" || rule.Declarations[2].Value != "var(--fg)" {
+		t.Errorf("decl[2]: got {%q, %q}, want {fill, var(--fg)}", rule.Declarations[2].Name, rule.Declarations[2].Value)
+	}
+}
+
 func TestStripPseudoClasses(t *testing.T) {
 	tests := []struct {
 		input string

@@ -6,4 +6,4 @@ package version
 
 // Version is the current version of ogvs.
 // It follows semantic versioning (https://semver.org/).
-const Version = "0.1.2"
+const Version = "0.1.3"

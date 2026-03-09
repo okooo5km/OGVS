@@ -67,6 +67,7 @@ brews:
       owner: okooo5km
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
     name: ogvs
     homepage: "https://github.com/okooo5km/ogvs"
     description: "Go implementation of SVGO — the SVG optimizer"

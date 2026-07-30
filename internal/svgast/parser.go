@@ -8,11 +8,32 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // entityDeclaration matches ENTITY declarations in DOCTYPE internal subset.
 var entityDeclaration = regexp.MustCompile(`<!ENTITY\s+(\S+)\s+(?:'([^']+)'|"([^"]+)")\s*>`)
+
+// MaxNestingDepth caps how deeply elements may nest. Deep nesting is a
+// denial-of-service vector: several parts of the pipeline (notably
+// css.ComputeStyle's ancestor walk, which mirrors SVGO's) cost O(depth) per
+// element, so a spine of N nested elements costs O(N^2).
+//
+// The bound is chosen far above anything legitimate: across 31809 SVG files on
+// a developer machine the deepest was 11 levels, and SVGO's own 363 plugin
+// fixtures top out at 6. Node SVGO itself throws
+// "RangeError: Maximum call stack size exceeded" from its stringifier at around
+// 2300 levels, so this limit never rejects a file the reference implementation
+// would have optimized.
+const MaxNestingDepth = 1024
+
+// MaxNodeCount caps the number of elements in a document. Every plugin visits
+// every node, so the element count is a direct multiplier on the whole
+// pipeline. The largest real-world SVG found in the same 31809-file scan had
+// 14730 elements, so this leaves roughly 70x headroom.
+const MaxNodeCount = 1 << 20
 
 // ParserError represents an SVG parsing error with location information.
 type ParserError struct {
@@ -77,9 +98,12 @@ func (e *ParserError) FormatError() string {
 // - DOCTYPE with ENTITY declarations are handled
 // - Processing instructions are preserved
 func ParseSvg(data string, from string) (*Root, error) {
+	data = toValidUTF8(data)
+
 	root := &Root{}
 	var current Parent = root
 	stack := []Parent{root}
+	nodeCount := 0
 
 	// Entity map for custom entities from DOCTYPE
 	entities := make(map[string]string)
@@ -94,7 +118,10 @@ func ParseSvg(data string, from string) (*Root, error) {
 	}
 
 	// Replace custom entities in the data before parsing
-	processedData := replaceEntities(data, entities)
+	processedData, err := replaceEntities(data, entities)
+	if err != nil {
+		return nil, err
+	}
 
 	decoder := xml.NewDecoder(strings.NewReader(processedData))
 	decoder.Strict = true
@@ -149,6 +176,13 @@ func ParseSvg(data string, from string) (*Root, error) {
 			current.SetChildren(append(current.GetChildren(), elem))
 			current = elem
 			stack = append(stack, elem)
+			if len(stack)-1 > MaxNestingDepth {
+				return nil, fmt.Errorf("element nesting exceeds %d levels (possible denial-of-service input)", MaxNestingDepth)
+			}
+			nodeCount++
+			if nodeCount > MaxNodeCount {
+				return nil, fmt.Errorf("document exceeds %d nodes (possible denial-of-service input)", MaxNodeCount)
+			}
 
 		case xml.EndElement:
 			if len(stack) > 1 {
@@ -167,6 +201,29 @@ func ParseSvg(data string, from string) (*Root, error) {
 			offset := int(decoder.InputOffset())
 			if offset >= 3 && offset <= len(processedData) && processedData[offset-3:offset] == "]]>" {
 				isCdata = true
+			}
+
+			// Text outside the root element is not well-formed. SVGO's SAX
+			// parser rejects it; without this check a document with no markup
+			// at all parses into an empty tree and stringifies to nothing,
+			// which in the CLI's default in-place mode destroys the file.
+			if _, inElement := current.(*Element); !inElement {
+				if strings.TrimSpace(text) != "" {
+					reason := "Text data outside of root node."
+					if len(root.Children) == 0 || !hasElementChild(root) {
+						reason = "Non-whitespace before first tag."
+					}
+					start := int(decoder.InputOffset()) - len(text)
+					line, col := offsetToLineCol(data, max(start, 0))
+					return nil, &ParserError{
+						Message: fmt.Sprintf("%s:%d:%d: %s", fileOrInput(from), line, col, reason),
+						Reason:  reason,
+						Line:    line,
+						Column:  col,
+						Source:  data,
+						File:    from,
+					}
+				}
 			}
 
 			// Check if current element is a textElem
@@ -217,6 +274,28 @@ func ParseSvg(data string, from string) (*Root, error) {
 	}
 
 	return root, nil
+}
+
+// hasElementChild reports whether the root already holds an element, i.e.
+// whether any markup has been seen.
+func hasElementChild(root *Root) bool {
+	for _, child := range root.Children {
+		if _, ok := child.(*Element); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// toValidUTF8 replaces invalid UTF-8 bytes with U+FFFD. SVGO reads its input
+// through Node's UTF-8 decoder, which substitutes the replacement character
+// and carries on; Go's encoding/xml instead rejects the whole document, so
+// legacy Latin-1 files and stray high bytes have to be folded first.
+func toValidUTF8(data string) string {
+	if utf8.ValidString(data) {
+		return data
+	}
+	return strings.ToValidUTF8(data, "�")
 }
 
 // rawAttrName builds the attribute name from the raw xml.Name,
@@ -286,16 +365,151 @@ func extractDoctype(data string, entities map[string]string) *Doctype {
 	}
 }
 
-// replaceEntities replaces custom entity references in the data.
-func replaceEntities(data string, entities map[string]string) string {
+// maxEntityExpansion caps the size of the entity-expanded document. Internal
+// DTD entities can be crafted to expand exponentially (billion laughs) or
+// quadratically (one large value referenced many times), exhausting memory.
+// A legitimate SVG never needs this much expansion; anything larger is rejected.
+const maxEntityExpansion = 32 * 1024 * 1024 // 32 MB
+
+// errEntityExpansion is returned once expansion outgrows maxEntityExpansion.
+var errEntityExpansion = fmt.Errorf("entity expansion exceeds %d bytes (possible entity-expansion attack)", maxEntityExpansion)
+
+// entityResolver expands entity references to a fixed point.
+//
+// SVGO configures sax with unparsedEntities, which feeds an entity's value
+// back through the parser, so an entity whose value references another entity
+// resolves all the way down. Values are therefore expanded before they are
+// substituted into the document, and both the per-value and the cumulative
+// sizes are bounded so that recursive or exponentially nested declarations
+// cannot exhaust memory.
+type entityResolver struct {
+	entities map[string]string
+	resolved map[string]string
+	visiting map[string]bool
+	total    int
+	err      error
+}
+
+func newEntityResolver(entities map[string]string) *entityResolver {
+	return &entityResolver{
+		entities: entities,
+		resolved: make(map[string]string, len(entities)),
+		visiting: make(map[string]bool, len(entities)),
+	}
+}
+
+// isEntityNameByte reports whether c may appear inside an entity name. Names
+// come from the DOCTYPE internal subset, where they are matched as a run of
+// non-whitespace, so only the characters that end or invalidate a reference
+// are excluded.
+func isEntityNameByte(c byte) bool {
+	switch c {
+	case ';', '&', '<', '>', ' ', '\t', '\r', '\n':
+		return false
+	}
+	return true
+}
+
+// lookup returns the fully expanded value of a declared entity.
+func (r *entityResolver) lookup(name string) (string, bool) {
+	raw, declared := r.entities[name]
+	if !declared {
+		return "", false
+	}
+	if value, ok := r.resolved[name]; ok {
+		return value, true
+	}
+	if r.visiting[name] {
+		// Self- or mutually-recursive declaration: keep the reference literal
+		// so expansion terminates.
+		return "&" + name + ";", true
+	}
+
+	r.visiting[name] = true
+	value, err := r.expand(raw)
+	delete(r.visiting, name)
+	if err != nil {
+		r.err = err
+		return "", false
+	}
+
+	r.total += len(value)
+	if r.total > maxEntityExpansion {
+		r.err = errEntityExpansion
+		return "", false
+	}
+	r.resolved[name] = value
+	return value, true
+}
+
+// expand rewrites every declared entity reference in s with its expanded
+// value, scanning left to right so the result never depends on map order.
+func (r *entityResolver) expand(s string) (string, error) {
+	if !strings.ContainsRune(s, '&') {
+		return s, nil
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '&' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(s) && isEntityNameByte(s[j]) {
+			j++
+		}
+		if j < len(s) && s[j] == ';' && j > i+1 {
+			if value, ok := r.lookup(s[i+1 : j]); ok {
+				b.WriteString(value)
+				if b.Len() > maxEntityExpansion {
+					return "", errEntityExpansion
+				}
+				i = j + 1
+				continue
+			}
+			if r.err != nil {
+				return "", r.err
+			}
+		}
+		b.WriteByte('&')
+		i++
+	}
+	return b.String(), nil
+}
+
+// replaceEntities replaces custom entity references in the data. It bounds the
+// total expanded size to prevent entity-expansion denial-of-service attacks.
+func replaceEntities(data string, entities map[string]string) (string, error) {
 	if len(entities) == 0 {
-		return data
+		return data, nil
 	}
-	result := data
-	for name, value := range entities {
-		result = strings.ReplaceAll(result, "&"+name+";", value)
+
+	r := newEntityResolver(entities)
+
+	// Expand every declared value up front, in name order, so that a cycle is
+	// always broken at the same reference regardless of where the document
+	// happens to enter it.
+	names := make([]string, 0, len(entities))
+	for name := range entities {
+		names = append(names, name)
 	}
-	return result
+	sort.Strings(names)
+	for _, name := range names {
+		if _, ok := r.lookup(name); !ok && r.err != nil {
+			return "", r.err
+		}
+	}
+
+	result, err := r.expand(data)
+	if err != nil {
+		return "", err
+	}
+	if r.err != nil {
+		return "", r.err
+	}
+	return result, nil
 }
 
 // offsetToLineCol converts a byte offset to line and column numbers.

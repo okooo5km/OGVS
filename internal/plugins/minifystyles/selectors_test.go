@@ -171,7 +171,7 @@ func TestRemoveUnusedRulesEscapes(t *testing.T) {
 		{"char escaped class matches raw", `.a\.b{fill:red}`, `.a\.b{fill:red}`},
 		{"char escaped class unused", `.a\.c{fill:red}`, ``},
 		{"escaped id", `#\75 sed{fill:red}`, ``},
-		{"escaped tag", `\72 ect{fill:red}`, ``},
+		{"escaped tag", `\72 ect{fill:red}`, ``}, //nolint:misspell // CSS-escaped spelling of "rect"
 		{"escape inside tag", `r\65 ct{fill:red}`, ``},
 	}
 	for _, tt := range tests {

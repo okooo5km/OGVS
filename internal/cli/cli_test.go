@@ -488,6 +488,11 @@ func TestCLI_ConfigWithPluginParams(t *testing.T) {
 func TestCLI_ConfigDiscovery(t *testing.T) {
 	dir := t.TempDir()
 
+	// Mark dir as the project root — the upward search stops there.
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	// Create a config file in the "project" root
 	configContent := `plugins:
   - name: preset-default

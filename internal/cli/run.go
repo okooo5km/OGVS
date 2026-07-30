@@ -22,6 +22,10 @@ import (
 	"github.com/okooo5km/ogvs/internal/tools"
 )
 
+// effectiveDataURI is the data URI mode in force for this run: the config
+// file's datauri, overridden by --datauri. Resolved once in loadFinalConfig.
+var effectiveDataURI string
+
 // run is the main CLI action dispatched from rootCmd.RunE.
 func run(cmd *cobra.Command, args []string) error {
 	// --show-plugins: list plugins and exit
@@ -65,6 +69,12 @@ func loadFinalConfig(cmd *cobra.Command) (*core.Config, error) {
 				fileCfg, err = loadConfig(path)
 				if err != nil {
 					return nil, err
+				}
+				// An auto-discovered config changes the plugin set without the
+				// user ever naming it, so say which file won. An explicit
+				// --config needs no such note.
+				if !flagQuiet {
+					fmt.Fprintf(os.Stderr, "Using config %s\n", path)
 				}
 			}
 		}
@@ -126,6 +136,21 @@ func loadFinalConfig(cmd *cobra.Command) (*core.Config, error) {
 		if cmd.Flags().Changed("final-newline") {
 			cfg.Js2svg.FinalNewline = flagFinalNL
 		}
+	}
+
+	// datauri: config file value, with the flag taking precedence.
+	// PersistentPreRunE only validates the flag, so validate the merged value.
+	effectiveDataURI = ""
+	if fileCfg != nil {
+		effectiveDataURI = fileCfg.DataURI
+	}
+	if cmd.Flags().Changed("datauri") {
+		effectiveDataURI = flagDataURI
+	}
+	switch effectiveDataURI {
+	case "", "base64", "enc", "unenc":
+	default:
+		return nil, fmt.Errorf("datauri must be 'base64', 'enc', or 'unenc', got %q", effectiveDataURI)
 	}
 
 	return cfg, nil
@@ -209,8 +234,8 @@ func processSVGData(cfg *core.Config, data string, outputPath string, inputName 
 	output := result.Data
 
 	// Apply data URI encoding if requested
-	if flagDataURI != "" {
-		output = tools.EncodeSVGDataURI(output, flagDataURI)
+	if effectiveDataURI != "" {
+		output = tools.EncodeSVGDataURI(output, effectiveDataURI)
 	}
 
 	elapsed := time.Since(start)
@@ -253,8 +278,8 @@ func optimizeFile(cfg *core.Config, inputPath string, outputPath string) error {
 	output := result.Data
 
 	// Apply data URI encoding if requested
-	if flagDataURI != "" {
-		output = tools.EncodeSVGDataURI(output, flagDataURI)
+	if effectiveDataURI != "" {
+		output = tools.EncodeSVGDataURI(output, effectiveDataURI)
 	}
 
 	elapsed := time.Since(start)
@@ -312,6 +337,13 @@ func optimizeFolder(cfg *core.Config) error {
 			return nil
 		}
 
+		// Skip symlinks: in-place optimization writes through them, so a
+		// planted *.svg link would truncate whatever file it points at.
+		// filepath.Walk uses Lstat, so info describes the link itself.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+
 		// Only process .svg files
 		if strings.ToLower(filepath.Ext(path)) != ".svg" {
 			return nil
@@ -340,6 +372,11 @@ func writeFile(path string, data string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+	// Refuse to write through a symlink: os.WriteFile would follow it and
+	// truncate the target, which may live outside the intended directory.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write through symlink %s", path)
 	}
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		return fmt.Errorf("failed to write %s: %w", path, err)

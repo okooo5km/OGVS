@@ -43,12 +43,15 @@ func Optimize(input string, config *Config) (*Output, error) {
 	}
 
 	// Build global overrides
+	// Plugins read numeric params as float64 (the shape JSON decoding
+	// produces), so the override has to be widened before it is handed over.
 	globalOverrides := make(map[string]any)
 	if config.FloatPrecision != nil {
-		globalOverrides["floatPrecision"] = *config.FloatPrecision
+		globalOverrides["floatPrecision"] = float64(*config.FloatPrecision)
 	}
 
 	currentInput := input
+	output := input
 	prevSize := math.MaxInt // ensure first pass always runs (matches SVGO's Number.MAX_SAFE_INTEGER)
 
 	for i := range maxPasses {
@@ -68,9 +71,11 @@ func Optimize(input string, config *Config) (*Output, error) {
 		}
 
 		// Stringify
-		output := svgast.StringifySvg(root, js2svg)
+		output = svgast.StringifySvg(root, js2svg)
 
-		// Check convergence
+		// Check convergence. SVGO keeps the bytes of the pass it just ran even
+		// when that pass did not shrink the document, so the result of the
+		// final, non-improving pass is what gets returned.
 		if len(output) >= prevSize {
 			break
 		}
@@ -79,5 +84,5 @@ func Optimize(input string, config *Config) (*Output, error) {
 		currentInput = output
 	}
 
-	return &Output{Data: currentInput}, nil
+	return &Output{Data: output}, nil
 }

@@ -6,6 +6,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/okooo5km/ogvs/internal/plugin"
@@ -13,12 +14,16 @@ import (
 
 // ---------- discoverConfig ----------
 
-func TestDiscoverConfig_FoundYaml(t *testing.T) {
+func TestDiscoverConfig_FoundInProjectRoot(t *testing.T) {
 	// Create temp dir structure: base/sub1/sub2/
 	base := t.TempDir()
 	sub1 := filepath.Join(base, "sub1")
 	sub2 := filepath.Join(sub1, "sub2")
 	if err := os.MkdirAll(sub2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The upward search is bounded by the project root marker.
+	if err := os.MkdirAll(filepath.Join(base, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,19 +94,110 @@ func TestDiscoverConfig_NotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := discoverConfig(sub)
-	// The search goes all the way up to root, so it might find a real config.
-	// We verify that if it found something, it's not inside our temp dir (which has no config).
-	// In practice, there should be no ogvs.config.yaml at / or other parents of /tmp.
-	if got != "" {
-		// Check it's not inside our temp dir (it shouldn't be, since we didn't create one)
-		rel, err := filepath.Rel(base, got)
-		if err == nil && !filepath.IsAbs(rel) && rel[0] != '.' {
-			t.Errorf("discoverConfig(%q) found config inside temp dir: %q, but we didn't create one", sub, got)
-		}
-		// If it found something outside our temp dir, that's the real filesystem — acceptable.
-		// But for a clean test, we just note it.
-		t.Logf("note: discoverConfig found config outside temp dir at %q (real filesystem)", got)
+	if got := discoverConfig(sub); got != "" {
+		t.Errorf("discoverConfig(%q) = %q, want %q", sub, got, "")
+	}
+}
+
+func TestDiscoverConfig_StopsAtProjectRoot(t *testing.T) {
+	// base/ogvs.config.yaml sits ABOVE the project root at base/project,
+	// so it must not be picked up from base/project/sub.
+	base := t.TempDir()
+	project := filepath.Join(base, "project")
+	sub := filepath.Join(project, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "ogvs.config.yaml"), []byte("multipass: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := discoverConfig(sub); got != "" {
+		t.Errorf("discoverConfig(%q) = %q, want %q (config above the project root must be ignored)", sub, got, "")
+	}
+}
+
+func TestDiscoverConfig_NoMarkerAncestorIgnored(t *testing.T) {
+	// No project marker anywhere: only cwd is consulted, so a config planted
+	// in a shared parent directory (/tmp, $HOME) has no effect.
+	base := t.TempDir()
+	sub := filepath.Join(base, "sub1", "sub2")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "ogvs.config.yaml"), []byte("multipass: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := discoverConfig(sub); got != "" {
+		t.Errorf("discoverConfig(%q) = %q, want %q (ancestor config without a project root must be ignored)", sub, got, "")
+	}
+}
+
+func TestDiscoverConfig_DirectoryNamedConfigSkipped(t *testing.T) {
+	// A directory named ogvs.config.yaml is not a config file: skip it and
+	// keep searching, as SVGO's stats.isFile() guard does.
+	base := t.TempDir()
+	sub := filepath.Join(base, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sub, "ogvs.config.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(base, "ogvs.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("multipass: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := discoverConfig(sub); got != cfgPath {
+		t.Errorf("discoverConfig(%q) = %q, want %q", sub, got, cfgPath)
+	}
+}
+
+func TestDiscoverConfig_GitAsFileWorktree(t *testing.T) {
+	// In a worktree or submodule checkout .git is a file, not a directory.
+	base := t.TempDir()
+	deep := filepath.Join(base, "a", "b")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(base, "ogvs.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("multipass: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := discoverConfig(deep); got != cfgPath {
+		t.Errorf("discoverConfig(%q) = %q, want %q", deep, got, cfgPath)
+	}
+}
+
+func TestDiscoverConfig_CwdWinsWithoutMarker(t *testing.T) {
+	// cwd is always in scope even when there is no project root at all.
+	base := t.TempDir()
+	sub := filepath.Join(base, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(sub, "ogvs.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("multipass: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := discoverConfig(sub); got != cfgPath {
+		t.Errorf("discoverConfig(%q) = %q, want %q", sub, got, cfgPath)
 	}
 }
 
@@ -113,6 +209,9 @@ func TestDiscoverConfig_NestedFindsClosest(t *testing.T) {
 	inner := filepath.Join(base, "inner")
 	deep := filepath.Join(inner, "deep")
 	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,6 +335,51 @@ func TestLoadConfig_FileNotFound(t *testing.T) {
 	_, err := loadConfig(path)
 	if err == nil {
 		t.Fatal("expected error for nonexistent file, got nil")
+	}
+}
+
+func TestLoadConfig_Directory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ogvs.config.yaml")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("expected error for a directory config path, got nil")
+	}
+	if !containsSubstring(err.Error(), "is a directory") {
+		t.Errorf("error should mention 'is a directory', got: %q", err.Error())
+	}
+}
+
+func TestLoadConfig_NonRegularReadableSource(t *testing.T) {
+	// Process substitution (--config <(echo ...)) and pipes hand loadConfig a
+	// FIFO or character device rather than a regular file.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fifo.yaml")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString("multipass: true\nfloatPrecision: 2\n")
+	}()
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig on a FIFO failed: %v", err)
+	}
+	if !cfg.Multipass {
+		t.Error("multipass = false, want true")
+	}
+	if cfg.FloatPrecision == nil || *cfg.FloatPrecision != 2 {
+		t.Errorf("floatPrecision = %v, want 2", cfg.FloatPrecision)
 	}
 }
 

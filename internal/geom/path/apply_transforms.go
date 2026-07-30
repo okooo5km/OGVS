@@ -28,13 +28,19 @@ type ApplyTransformsParams struct {
 
 // ApplyTransformsVisitor returns a visitor that applies transforms to path data.
 // Ported from SVGO's applyTransforms plugin in plugins/applyTransforms.js.
-func ApplyTransformsVisitor(root *svgast.Root, params *ApplyTransformsParams) *svgast.Visitor {
+//
+// Transformed path data is recorded in transformed rather than serialized back
+// into the d attribute, mirroring the pathJS array SVGO caches on the node.
+// Callers must hand that data to convertPathData: a detour through the d
+// attribute would collapse consecutive movetos before their coordinates are
+// resolved and would lose any non-finite coordinate the transform produced.
+func ApplyTransformsVisitor(root *svgast.Root, params *ApplyTransformsParams, transformed map[*svgast.Element][]PathDataItem) *svgast.Visitor {
 	stylesheet := css.CollectStylesheet(root)
 	return &svgast.Visitor{
 		Element: &svgast.VisitorCallbacks{
 			Enter: func(node svgast.Node, parent svgast.Parent) error {
 				elem := node.(*svgast.Element)
-				applyTransformsToElement(elem, stylesheet, params)
+				applyTransformsToElement(elem, stylesheet, params, transformed)
 				return nil
 			},
 		},
@@ -42,7 +48,7 @@ func ApplyTransformsVisitor(root *svgast.Root, params *ApplyTransformsParams) *s
 }
 
 // applyTransformsToElement applies the transform attribute to a path element's d attribute.
-func applyTransformsToElement(elem *svgast.Element, stylesheet *css.Stylesheet, params *ApplyTransformsParams) {
+func applyTransformsToElement(elem *svgast.Element, stylesheet *css.Stylesheet, params *ApplyTransformsParams, transformed map[*svgast.Element][]PathDataItem) {
 	dVal, hasD := elem.Attributes.Get("d")
 	if !hasD || dVal == "" {
 		return
@@ -153,13 +159,7 @@ func applyTransformsToElement(elem *svgast.Element, stylesheet *css.Stylesheet, 
 
 	pathData := Path2JS(elem)
 	ApplyMatrixToPathData(pathData, matrix.Data)
-
-	// Write the transformed path data back to the d attribute.
-	// In JS, path2js() caches pathData on the node, so subsequent calls
-	// (e.g., from convertPathData) see the transformed data. Since Go
-	// re-parses d each time, we must serialize the transformed data back.
-	// Use precision=-1 (no rounding) to avoid precision loss.
-	JS2Path(elem, pathData, -1, false)
+	transformed[elem] = pathData
 
 	// remove transform attr
 	elem.Attributes.Delete("transform")
@@ -190,7 +190,16 @@ func Path2JS(elem *svgast.Element) []PathDataItem {
 // Also removes consecutive moveto commands (last one wins).
 // Ported from SVGO's js2path() in plugins/_path.js.
 func JS2Path(elem *svgast.Element, data []PathDataItem, floatPrecision int, noSpaceAfterFlags bool) {
-	// Remove moveto commands which are followed by moveto commands
+	elem.Attributes.Set("d", StringifyPathData(&StringifyPathDataOptions{
+		PathData:               collapseRedundantMovetos(data),
+		Precision:              floatPrecision,
+		DisableSpaceAfterFlags: noSpaceAfterFlags,
+	}))
+}
+
+// collapseRedundantMovetos drops moveto commands which are followed by moveto
+// commands, keeping the last one of each run.
+func collapseRedundantMovetos(data []PathDataItem) []PathDataItem {
 	var pathData []PathDataItem
 	for _, item := range data {
 		if len(pathData) != 0 &&
@@ -205,12 +214,7 @@ func JS2Path(elem *svgast.Element, data []PathDataItem, floatPrecision int, noSp
 			Args:    item.Args,
 		})
 	}
-
-	elem.Attributes.Set("d", StringifyPathData(&StringifyPathDataOptions{
-		PathData:               pathData,
-		Precision:              floatPrecision,
-		DisableSpaceAfterFlags: noSpaceAfterFlags,
-	}))
+	return pathData
 }
 
 // transformAbsolutePoint applies a matrix to an absolute point.

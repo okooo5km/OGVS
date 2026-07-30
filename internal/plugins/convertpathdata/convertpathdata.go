@@ -137,12 +137,15 @@ func fn(root *svgast.Root, params map[string]any, _ *plugin.PluginInfo) *svgast.
 		ForceAbsolutePath:      forceAbsolutePath,
 	}
 
-	// Invoke applyTransforms plugin
+	// Invoke applyTransforms plugin. It hands the transformed path data over in
+	// memory, the way SVGO's pathJS cache does, so nothing is lost to an
+	// intermediate d attribute.
+	transformed := make(map[*svgast.Element][]path.PathDataItem)
 	if applyTransformsParam {
 		visitor := path.ApplyTransformsVisitor(root, &path.ApplyTransformsParams{
 			TransformPrecision:     transformPrecision,
 			ApplyTransformsStroked: applyTransformsStroked,
-		})
+		}, transformed)
 		svgast.Visit(root, visitor, nil)
 	}
 
@@ -183,7 +186,10 @@ func fn(root *svgast.Root, params map[string]any, _ *plugin.PluginInfo) *svgast.
 						computedStyle["stroke-linejoin"].Value == "round"
 				}
 
-				rawData := path.Path2JS(elem)
+				rawData, ok := transformed[elem]
+				if !ok {
+					rawData = path.Path2JS(elem)
+				}
 
 				if len(rawData) == 0 {
 					return nil

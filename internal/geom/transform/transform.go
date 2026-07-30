@@ -6,6 +6,7 @@
 package transform
 
 import (
+	"errors"
 	"math"
 	"regexp"
 	"strconv"
@@ -13,6 +14,14 @@ import (
 
 	"github.com/okooo5km/ogvs/internal/tools"
 )
+
+// Products in the ported arithmetic below are wrapped in explicit float64
+// conversions. Go is free to contract an expression such as a*b + c*d into a
+// single fused multiply-add, which carries more intermediate precision than the
+// JavaScript being mirrored; the conversions force a rounding after each
+// multiplication so results agree with SVGO to the last bit. Dropping them
+// shifts decomposed rotation angles by an ULP, which is enough to flip a
+// Math.round at a halfway value.
 
 // TransformItem represents a single transform function with its parameters.
 type TransformItem struct {
@@ -52,53 +61,106 @@ var regNumericValues = regexp.MustCompile(
 	`[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?`)
 
 // Transform2JS converts a transform attribute string to a slice of TransformItems.
-// Returns nil if the string is malformed.
+// Returns nil if the string is malformed, matching SVGO's empty-array result.
+//
+// The traversal mirrors SVGO's `transformString.split(regTransformSplit)`: the
+// split regexp carries capture groups, so the resulting chunks alternate between
+// the text between matches, the transform name and the parenthesised arguments.
+// Numbers found in any chunk — including text trailing the last closing paren —
+// are appended to the transform currently being built, and a bare transform name
+// outside parentheses starts a new, empty one. That empty trailing transform is
+// what makes the whole attribute malformed.
 func Transform2JS(transformString string) []TransformItem {
 	var transforms []TransformItem
-	var current *TransformItem
+	current := -1
 
-	parts := regTransformSplit.Split(transformString, -1)
-	matches := regTransformSplit.FindAllStringSubmatch(transformString, -1)
-
-	// The split/match approach: matches give us transform names and their param strings
-	_ = parts
-	for _, m := range matches {
-		name := m[1]
-		paramStr := m[2]
-		if !transformTypes[name] {
+	for _, chunk := range splitWithCaptures(regTransformSplit, transformString) {
+		if chunk == "" {
 			continue
 		}
-		item := TransformItem{Name: name}
-		nums := regNumericValues.FindAllString(paramStr, -1)
-		for _, numStr := range nums {
-			if v, err := strconv.ParseFloat(numStr, 64); err == nil {
-				item.Data = append(item.Data, v)
+		if transformTypes[chunk] {
+			transforms = append(transforms, TransformItem{Name: chunk})
+			current = len(transforms) - 1
+			continue
+		}
+		for _, numStr := range regNumericValues.FindAllString(chunk, -1) {
+			if current >= 0 {
+				transforms[current].Data = append(transforms[current].Data, jsNumber(numStr))
 			}
 		}
-		transforms = append(transforms, item)
-		current = &transforms[len(transforms)-1]
 	}
 
-	if current == nil || len(current.Data) == 0 {
+	if current < 0 || len(transforms[current].Data) == 0 {
 		return nil
 	}
 
 	return transforms
 }
 
-// TransformsMultiply multiplies multiple transforms into a single matrix.
-func TransformsMultiply(transforms []TransformItem) TransformItem {
-	if len(transforms) == 0 {
-		return TransformItem{Name: "matrix", Data: nil}
+// splitWithCaptures reproduces JavaScript's String.prototype.split with a
+// regexp containing capture groups: the text between matches interleaved with
+// each match's captures, with non-participating groups yielding "".
+func splitWithCaptures(re *regexp.Regexp, s string) []string {
+	var out []string
+	last := 0
+	for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+		out = append(out, s[last:m[0]])
+		for g := 1; 2*g+1 < len(m); g++ {
+			if m[2*g] < 0 {
+				out = append(out, "")
+			} else {
+				out = append(out, s[m[2*g]:m[2*g+1]])
+			}
+		}
+		last = m[1]
 	}
+	return append(out, s[last:])
+}
 
-	result := transformToMatrix(&transforms[0])
-	for i := 1; i < len(transforms); i++ {
+// jsNumber converts a numeric literal to a float64 the way JavaScript's
+// Number() does. Out-of-range magnitudes saturate to ±Inf (or 0) rather than
+// being discarded, so a six-argument matrix always yields six values.
+func jsNumber(s string) float64 {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
+		return math.NaN()
+	}
+	return v
+}
+
+// TransformsMultiply multiplies multiple transforms into a single matrix.
+//
+// The result always carries at least six values. SVGO leaves short matrices
+// short and lets the missing arguments read as undefined, which every consumer
+// then propagates as NaN; padding with NaN here is the same arithmetic without
+// an out-of-range index on every read.
+func TransformsMultiply(transforms []TransformItem) TransformItem {
+	var result []float64
+	for i := range transforms {
 		m := transformToMatrix(&transforms[i])
+		if i == 0 {
+			result = m
+			continue
+		}
 		result = MultiplyTransformMatrices(result, m)
 	}
 
-	return TransformItem{Name: "matrix", Data: result}
+	return TransformItem{Name: "matrix", Data: padMatrix(result)}
+}
+
+// padMatrix returns a copy of data holding at least six values, filling any
+// missing ones with NaN. Extra values are preserved.
+func padMatrix(data []float64) []float64 {
+	size := len(data)
+	if size < 6 {
+		size = 6
+	}
+	out := make([]float64, size)
+	copy(out, data)
+	for i := len(data); i < size; i++ {
+		out[i] = math.NaN()
+	}
+	return out
 }
 
 // Math utilities for degree-based trig.
@@ -138,73 +200,75 @@ func AtanDeg(val float64, floatPrecision int) float64 {
 }
 
 // transformToMatrix converts a transform to a 6-element matrix [a, b, c, d, e, f].
+// Arguments the attribute did not supply read as NaN, except where SVGO applies
+// a `|| 0` or `?? data[0]` default.
 func transformToMatrix(t *TransformItem) []float64 {
 	if t.Name == "matrix" {
 		return t.Data
 	}
 
+	data := t.Data
 	switch t.Name {
 	case "translate":
-		ty := 0.0
-		if len(t.Data) > 1 {
-			ty = t.Data[1]
-		}
-		return []float64{1, 0, 0, 1, t.Data[0], ty}
+		return []float64{1, 0, 0, 1, tools.JSIndex(data, 0), tools.JSOr(tools.JSIndex(data, 1), 0)}
 
 	case "scale":
-		sy := t.Data[0]
-		if len(t.Data) > 1 {
-			sy = t.Data[1]
+		sy := tools.JSIndex(data, 0)
+		if len(data) > 1 {
+			sy = data[1]
 		}
-		return []float64{t.Data[0], 0, 0, sy, 0, 0}
+		return []float64{tools.JSIndex(data, 0), 0, 0, sy, 0, 0}
 
 	case "rotate":
-		cos := cosDeg(t.Data[0])
-		sin := sinDeg(t.Data[0])
-		cx := 0.0
-		cy := 0.0
-		if len(t.Data) > 1 {
-			cx = t.Data[1]
-		}
-		if len(t.Data) > 2 {
-			cy = t.Data[2]
-		}
+		angle := tools.JSIndex(data, 0)
+		cos := cosDeg(angle)
+		sin := sinDeg(angle)
+		cx := tools.JSOr(tools.JSIndex(data, 1), 0)
+		cy := tools.JSOr(tools.JSIndex(data, 2), 0)
 		return []float64{
 			cos, sin, -sin, cos,
-			(1-cos)*cx + sin*cy,
-			(1-cos)*cy - sin*cx,
+			float64((1-cos)*cx) + float64(sin*cy),
+			float64((1-cos)*cy) - float64(sin*cx),
 		}
 
 	case "skewX":
-		return []float64{1, 0, tanDeg(t.Data[0]), 1, 0, 0}
+		return []float64{1, 0, tanDeg(tools.JSIndex(data, 0)), 1, 0, 0}
 
 	case "skewY":
-		return []float64{1, tanDeg(t.Data[0]), 0, 1, 0, 0}
+		return []float64{1, tanDeg(tools.JSIndex(data, 0)), 0, 1, 0, 0}
 	}
 
 	return []float64{1, 0, 0, 1, 0, 0} // identity
 }
 
 // MultiplyTransformMatrices multiplies two 2D affine transformation matrices.
-// Each matrix is [a, b, c, d, e, f].
+// Each matrix is [a, b, c, d, e, f]; missing components contribute NaN.
 func MultiplyTransformMatrices(a, b []float64) []float64 {
+	a0, a1, a2, a3, a4, a5 := matrixComponents(a)
+	b0, b1, b2, b3, b4, b5 := matrixComponents(b)
 	return []float64{
-		a[0]*b[0] + a[2]*b[1],
-		a[1]*b[0] + a[3]*b[1],
-		a[0]*b[2] + a[2]*b[3],
-		a[1]*b[2] + a[3]*b[3],
-		a[0]*b[4] + a[2]*b[5] + a[4],
-		a[1]*b[4] + a[3]*b[5] + a[5],
+		float64(a0*b0) + float64(a2*b1),
+		float64(a1*b0) + float64(a3*b1),
+		float64(a0*b2) + float64(a2*b3),
+		float64(a1*b2) + float64(a3*b3),
+		float64(a0*b4) + float64(a2*b5) + a4,
+		float64(a1*b4) + float64(a3*b5) + a5,
 	}
+}
+
+// matrixComponents destructures the six components of a matrix, yielding NaN for
+// any the slice does not hold.
+func matrixComponents(data []float64) (a, b, c, d, e, f float64) {
+	return tools.JSIndex(data, 0), tools.JSIndex(data, 1), tools.JSIndex(data, 2),
+		tools.JSIndex(data, 3), tools.JSIndex(data, 4), tools.JSIndex(data, 5)
 }
 
 // decomposeQRAB decomposes a matrix using QR decomposition (method A/B).
 // Returns translate → rotate → scale → skewX, or nil if singular.
 func decomposeQRAB(matrix *TransformItem) []TransformItem {
-	data := matrix.Data
-	a, b, c, d, e, f := data[0], data[1], data[2], data[3], data[4], data[5]
+	a, b, c, d, e, f := matrixComponents(matrix.Data)
 
-	delta := a*d - b*c
+	delta := float64(a*d) - float64(b*c)
 	if delta == 0 {
 		return nil
 	}
@@ -216,7 +280,7 @@ func decomposeQRAB(matrix *TransformItem) []TransformItem {
 
 	var decomposition []TransformItem
 
-	if e != 0 || f != 0 {
+	if !tools.JSFalsy(e) || !tools.JSFalsy(f) {
 		decomposition = append(decomposition, TransformItem{
 			Name: "translate", Data: []float64{e, f},
 		})
@@ -241,10 +305,10 @@ func decomposeQRAB(matrix *TransformItem) []TransformItem {
 		})
 	}
 
-	acPlusBD := a*c + b*d
-	if acPlusBD != 0 {
+	acPlusBD := float64(a*c) + float64(b*d)
+	if !tools.JSFalsy(acPlusBD) {
 		decomposition = append(decomposition, TransformItem{
-			Name: "skewX", Data: []float64{deg(math.Atan(acPlusBD / (a*a + b*b)))},
+			Name: "skewX", Data: []float64{deg(math.Atan(acPlusBD / (float64(a*a) + float64(b*b))))},
 		})
 	}
 
@@ -254,10 +318,9 @@ func decomposeQRAB(matrix *TransformItem) []TransformItem {
 // decomposeQRCD decomposes a matrix using QR decomposition (method C/D).
 // Returns translate → rotate → scale → skewY, or nil if singular.
 func decomposeQRCD(matrix *TransformItem) []TransformItem {
-	data := matrix.Data
-	a, b, c, d, e, f := data[0], data[1], data[2], data[3], data[4], data[5]
+	a, b, c, d, e, f := matrixComponents(matrix.Data)
 
-	delta := a*d - b*c
+	delta := float64(a*d) - float64(b*c)
 	if delta == 0 {
 		return nil
 	}
@@ -269,7 +332,7 @@ func decomposeQRCD(matrix *TransformItem) []TransformItem {
 
 	var decomposition []TransformItem
 
-	if e != 0 || f != 0 {
+	if !tools.JSFalsy(e) || !tools.JSFalsy(f) {
 		decomposition = append(decomposition, TransformItem{
 			Name: "translate", Data: []float64{e, f},
 		})
@@ -292,10 +355,10 @@ func decomposeQRCD(matrix *TransformItem) []TransformItem {
 		})
 	}
 
-	acPlusBD := a*c + b*d
-	if acPlusBD != 0 {
+	acPlusBD := float64(a*c) + float64(b*d)
+	if !tools.JSFalsy(acPlusBD) {
 		decomposition = append(decomposition, TransformItem{
-			Name: "skewY", Data: []float64{deg(math.Atan(acPlusBD / (c*c + d*d)))},
+			Name: "skewY", Data: []float64{deg(math.Atan(acPlusBD / (float64(c*c) + float64(d*d))))},
 		})
 	}
 
@@ -307,8 +370,8 @@ func mergeTranslateAndRotate(tx, ty, a float64) TransformItem {
 	rotationAngleRads := rad(a)
 	d := 1 - math.Cos(rotationAngleRads)
 	e := math.Sin(rotationAngleRads)
-	cy := (d*ty + e*tx) / (d*d + e*e)
-	cx := (tx - e*cy) / d
+	cy := (float64(d*ty) + float64(e*tx)) / (float64(d*d) + float64(e*e))
+	cx := (tx - float64(e*cy)) / d
 	return TransformItem{Name: "rotate", Data: []float64{a, cx, cy}}
 }
 
@@ -316,26 +379,34 @@ func mergeTranslateAndRotate(tx, ty, a float64) TransformItem {
 func isIdentityTransform(t *TransformItem) bool {
 	switch t.Name {
 	case "rotate", "skewX", "skewY":
-		return t.Data[0] == 0
+		return tools.JSIndex(t.Data, 0) == 0
 	case "scale":
-		return t.Data[0] == 1 && (len(t.Data) < 2 || t.Data[1] == 1)
+		return tools.JSIndex(t.Data, 0) == 1 && tools.JSIndex(t.Data, 1) == 1
 	case "translate":
-		return t.Data[0] == 0 && (len(t.Data) < 2 || t.Data[1] == 0)
+		return tools.JSIndex(t.Data, 0) == 0 && tools.JSIndex(t.Data, 1) == 0
 	}
 	return false
 }
 
 // createScaleTransform creates a scale transform, using short form if sx == sy.
 func createScaleTransform(data []float64) TransformItem {
-	if len(data) >= 2 && data[0] == data[1] {
-		return TransformItem{Name: "scale", Data: []float64{data[0]}}
+	end := 2
+	if tools.JSIndex(data, 0) == tools.JSIndex(data, 1) {
+		end = 1
 	}
-	result := make([]float64, len(data))
-	copy(result, data)
-	if len(result) > 2 {
-		result = result[:2]
+	return TransformItem{Name: "scale", Data: sliceData(data, 0, end)}
+}
+
+// sliceData copies data[start:end] with JavaScript Array.prototype.slice
+// semantics, clamping end to the length of data.
+func sliceData(data []float64, start, end int) []float64 {
+	if end > len(data) {
+		end = len(data)
 	}
-	return TransformItem{Name: "scale", Data: result}
+	if start > end {
+		start = end
+	}
+	return append([]float64(nil), data[start:end]...)
 }
 
 // optimize optimizes a sequence of rounded transforms, removing identities
@@ -353,7 +424,7 @@ func optimize(roundedTransforms, rawTransforms []TransformItem) []TransformItem 
 		data := rt.Data
 		switch rt.Name {
 		case "rotate":
-			if data[0] == 180 || data[0] == -180 {
+			if angle := tools.JSIndex(data, 0); angle == 180 || angle == -180 {
 				if index+1 < len(roundedTransforms) && roundedTransforms[index+1].Name == "scale" {
 					next := &roundedTransforms[index+1]
 					negated := make([]float64, len(next.Data))
@@ -370,11 +441,11 @@ func optimize(roundedTransforms, rawTransforms []TransformItem) []TransformItem 
 				continue
 			}
 			end := 1
-			if len(data) >= 3 && (data[1] != 0 || data[2] != 0) {
+			if !tools.JSFalsy(tools.JSIndex(data, 1)) || !tools.JSFalsy(tools.JSIndex(data, 2)) {
 				end = 3
 			}
 			optimized = append(optimized, TransformItem{
-				Name: "rotate", Data: append([]float64(nil), data[:end]...),
+				Name: "rotate", Data: sliceData(data, 0, end),
 			})
 
 		case "scale":
@@ -382,28 +453,30 @@ func optimize(roundedTransforms, rawTransforms []TransformItem) []TransformItem 
 
 		case "skewX", "skewY":
 			optimized = append(optimized, TransformItem{
-				Name: rt.Name, Data: []float64{data[0]},
+				Name: rt.Name, Data: []float64{tools.JSIndex(data, 0)},
 			})
 
 		case "translate":
 			if index+1 < len(roundedTransforms) {
 				next := &roundedTransforms[index+1]
+				nextAngle := tools.JSIndex(next.Data, 0)
 				if next.Name == "rotate" &&
-					next.Data[0] != 180 && next.Data[0] != -180 && next.Data[0] != 0 &&
-					len(next.Data) >= 3 && next.Data[1] == 0 && next.Data[2] == 0 {
+					nextAngle != 180 && nextAngle != -180 && nextAngle != 0 &&
+					tools.JSIndex(next.Data, 1) == 0 && tools.JSIndex(next.Data, 2) == 0 {
 					rawData := rawTransforms[index].Data
-					optimized = append(optimized,
-						mergeTranslateAndRotate(rawData[0], rawData[1], rawTransforms[index+1].Data[0]))
+					optimized = append(optimized, mergeTranslateAndRotate(
+						tools.JSIndex(rawData, 0), tools.JSIndex(rawData, 1),
+						tools.JSIndex(rawTransforms[index+1].Data, 0)))
 					index++
 					continue
 				}
 			}
 			end := 1
-			if len(data) >= 2 && data[1] != 0 {
+			if !tools.JSFalsy(tools.JSIndex(data, 1)) {
 				end = 2
 			}
 			optimized = append(optimized, TransformItem{
-				Name: "translate", Data: append([]float64(nil), data[:end]...),
+				Name: "translate", Data: sliceData(data, 0, end),
 			})
 		}
 	}
@@ -465,8 +538,8 @@ func TransformArc(cursor [2]float64, arc []float64, transform []float64) []float
 
 	// skip if radius is 0
 	if a > 0 && b > 0 {
-		h := math.Pow(x*cos+y*sin, 2)/(4*a*a) +
-			math.Pow(y*cos-x*sin, 2)/(4*b*b)
+		h := math.Pow(float64(x*cos)+float64(y*sin), 2)/(4*a*a) +
+			math.Pow(float64(y*cos)-float64(x*sin), 2)/(4*b*b)
 		if h > 1 {
 			h = math.Sqrt(h)
 			a *= h
@@ -477,8 +550,8 @@ func TransformArc(cursor [2]float64, arc []float64, transform []float64) []float
 	ellipse := []float64{a * cos, a * sin, -b * sin, b * cos, 0, 0}
 	m := MultiplyTransformMatrices(transform, ellipse)
 
-	lastCol := m[2]*m[2] + m[3]*m[3]
-	squareSum := m[0]*m[0] + m[1]*m[1] + lastCol
+	lastCol := float64(m[2]*m[2]) + float64(m[3]*m[3])
+	squareSum := float64(m[0]*m[0]) + float64(m[1]*m[1]) + lastCol
 	root := math.Hypot(m[0]-m[3], m[1]+m[2]) * math.Hypot(m[0]+m[3], m[1]-m[2])
 
 	if root == 0 {
@@ -494,9 +567,9 @@ func TransformArc(cursor [2]float64, arc []float64, transform []float64) []float
 		if !major {
 			sub = minorAxisSqr - lastCol
 		}
-		rowsSum := m[0]*m[2] + m[1]*m[3]
-		term1 := m[0]*sub + m[2]*rowsSum
-		term2 := m[1]*sub + m[3]*rowsSum
+		rowsSum := float64(m[0]*m[2]) + float64(m[1]*m[3])
+		term1 := float64(m[0]*sub) + float64(m[2]*rowsSum)
+		term2 := float64(m[1]*sub) + float64(m[3]*rowsSum)
 
 		arc[0] = math.Sqrt(majorAxisSqr)
 		arc[1] = math.Sqrt(minorAxisSqr)
@@ -532,21 +605,17 @@ func RoundTransform(t *TransformItem, params *TransformParams) {
 	case "translate":
 		t.Data = floatRound(t.Data, params)
 	case "rotate":
-		if len(t.Data) >= 1 {
-			degPart := degRound(t.Data[:1], params)
-			floatPart := floatRound(t.Data[1:], params)
-			t.Data = append(degPart, floatPart...)
-		}
+		degPart := degRound(sliceData(t.Data, 0, 1), params)
+		floatPart := floatRound(sliceData(t.Data, 1, len(t.Data)), params)
+		t.Data = append(degPart, floatPart...)
 	case "skewX", "skewY":
 		t.Data = degRound(t.Data, params)
 	case "scale":
 		t.Data = transformRound(t.Data, params)
 	case "matrix":
-		if len(t.Data) >= 6 {
-			transformPart := transformRound(t.Data[:4], params)
-			floatPart := floatRound(t.Data[4:], params)
-			t.Data = append(transformPart, floatPart...)
-		}
+		transformPart := transformRound(sliceData(t.Data, 0, 4), params)
+		floatPart := floatRound(sliceData(t.Data, 4, len(t.Data)), params)
+		t.Data = append(transformPart, floatPart...)
 	}
 }
 
@@ -574,27 +643,31 @@ func transformRound(data []float64, params *TransformParams) []float64 {
 func roundSlice(data []float64) []float64 {
 	result := make([]float64, len(data))
 	for i, v := range data {
-		result[i] = math.Round(v)
+		result[i] = tools.JSRound(v)
 	}
 	return result
 }
 
 // smartRound decreases accuracy of floating-point numbers keeping a specified
 // number of decimals. Smart rounds values like 2.349 to 2.35.
+//
+// SVGO mixes both rounding helpers here: the guard uses tools.toFixed
+// (Math.round semantics) while the tolerance and every produced value use the
+// native Number.prototype.toFixed, which breaks ties away from zero. The split
+// is what decides which way a negative halfway component such as -0.0625 goes.
 func smartRound(precision int, data []float64) []float64 {
 	result := make([]float64, len(data))
 	copy(result, data)
 
-	tolerance := math.Pow(0.1, float64(precision))
-	tolerance = tools.ToFixed(tolerance, precision)
+	tolerance := tools.NativeToFixed(math.Pow(0.1, float64(precision)), precision)
 
 	for i := len(result) - 1; i >= 0; i-- {
 		fixed := tools.ToFixed(result[i], precision)
 		if fixed != result[i] {
-			rounded := tools.ToFixed(result[i], precision-1)
-			diff := tools.ToFixed(math.Abs(rounded-result[i]), precision+1)
+			rounded := tools.NativeToFixed(result[i], precision-1)
+			diff := tools.NativeToFixed(math.Abs(rounded-result[i]), precision+1)
 			if diff >= tolerance {
-				result[i] = tools.ToFixed(result[i], precision)
+				result[i] = tools.NativeToFixed(result[i], precision)
 			} else {
 				result[i] = rounded
 			}

@@ -201,7 +201,7 @@ func Filters(
 
 	if precisionEnabled {
 		optimizePrecision = precision
-		optimizeError = tools.ToFixed(math.Pow(0.1, float64(precision)), precision)
+		optimizeError = tools.NativeToFixed(math.Pow(0.1, float64(precision)), precision)
 	} else {
 		optimizePrecision = 0
 		optimizeError = 1e-2
@@ -778,7 +778,7 @@ func strongRound(data []float64) []float64 {
 // simpleRound rounds all values to nearest integer (used when precision is 0 or false).
 func simpleRound(data []float64) []float64 {
 	for i := len(data) - 1; i >= 0; i-- {
-		data[i] = math.Round(data[i])
+		data[i] = tools.JSRound(data[i])
 	}
 	return data
 }

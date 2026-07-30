@@ -8,12 +8,12 @@ package converttransform
 
 import (
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/okooo5km/ogvs/internal/geom/transform"
 	"github.com/okooo5km/ogvs/internal/plugin"
 	"github.com/okooo5km/ogvs/internal/svgast"
+	"github.com/okooo5km/ogvs/internal/tools"
 )
 
 func init() {
@@ -164,8 +164,12 @@ func definePrecision(data []transform.TransformItem, params *transformParams) *t
 
 	var matrixData []float64
 	for _, item := range data {
-		if item.Name == "matrix" && len(item.Data) >= 4 {
-			matrixData = append(matrixData, item.Data[:4]...)
+		if item.Name == "matrix" {
+			end := 4
+			if end > len(item.Data) {
+				end = len(item.Data)
+			}
+			matrixData = append(matrixData, item.Data[:end]...)
 		}
 	}
 
@@ -220,7 +224,7 @@ var regDigits = regexp.MustCompile(`\D+`)
 // floatDigits returns the number of digits after the decimal point.
 // Example: 0.125 → 3
 func floatDigits(n float64) int {
-	str := strconv.FormatFloat(n, 'f', -1, 64)
+	str := tools.FormatNumber(n)
 	dotIdx := strings.Index(str, ".")
 	if dotIdx < 0 {
 		return 0
@@ -231,8 +235,7 @@ func floatDigits(n float64) int {
 // totalDigits returns the total number of digits in the number's string representation.
 // Example: 123.45 → 5
 func totalDigits(n float64) int {
-	str := strconv.FormatFloat(n, 'f', -1, 64)
-	digits := regDigits.ReplaceAllString(str, "")
+	digits := regDigits.ReplaceAllString(tools.FormatNumber(n), "")
 	return len(digits)
 }
 
@@ -271,7 +274,7 @@ func convertToShorts(transforms []transform.TransformItem, params *transformPara
 		if params.shortTranslate &&
 			t.Name == "translate" &&
 			len(t.Data) == 2 &&
-			t.Data[1] == 0 {
+			tools.JSFalsy(t.Data[1]) {
 			t.Data = t.Data[:1]
 		}
 
@@ -289,17 +292,15 @@ func convertToShorts(transforms []transform.TransformItem, params *transformPara
 			transforms[i-2].Name == "translate" &&
 			transforms[i-1].Name == "rotate" &&
 			transforms[i].Name == "translate" &&
-			len(transforms[i-2].Data) >= 2 &&
-			len(transforms[i].Data) >= 2 &&
-			transforms[i-2].Data[0] == -transforms[i].Data[0] &&
-			transforms[i-2].Data[1] == -transforms[i].Data[1] {
+			tools.JSIndex(transforms[i-2].Data, 0) == -tools.JSIndex(transforms[i].Data, 0) &&
+			tools.JSIndex(transforms[i-2].Data, 1) == -tools.JSIndex(transforms[i].Data, 1) {
 
 			merged := transform.TransformItem{
 				Name: "rotate",
 				Data: []float64{
-					transforms[i-1].Data[0],
-					transforms[i-2].Data[0],
-					transforms[i-2].Data[1],
+					tools.JSIndex(transforms[i-1].Data, 0),
+					tools.JSIndex(transforms[i-2].Data, 0),
+					tools.JSIndex(transforms[i-2].Data, 1),
 				},
 			}
 
@@ -332,6 +333,8 @@ func removeUseless(transforms []transform.TransformItem) []transform.TransformIt
 }
 
 // isUseless checks if a transform is an identity (no-op).
+// Arguments the attribute never supplied count as absent, which JavaScript
+// treats as falsy — matrix(1 0 0 1) is as useless as matrix(1 0 0 1 0 0).
 func isUseless(t transform.TransformItem) bool {
 	name := t.Name
 	data := t.Data
@@ -339,34 +342,32 @@ func isUseless(t transform.TransformItem) bool {
 	// translate(0), rotate(0[, cx, cy]), skewX(0), skewY(0)
 	if (name == "translate" || name == "rotate" || name == "skewX" || name == "skewY") &&
 		(len(data) == 1 || name == "rotate") &&
-		data[0] == 0 {
+		tools.JSFalsy(tools.JSIndex(data, 0)) {
 		return true
 	}
 
 	// translate(0, 0)
 	if name == "translate" &&
-		len(data) >= 2 &&
-		data[0] == 0 &&
-		data[1] == 0 {
+		tools.JSFalsy(tools.JSIndex(data, 0)) &&
+		tools.JSFalsy(tools.JSIndex(data, 1)) {
 		return true
 	}
 
 	// scale(1) or scale(1, 1)
 	if name == "scale" &&
-		data[0] == 1 &&
+		tools.JSIndex(data, 0) == 1 &&
 		(len(data) < 2 || data[1] == 1) {
 		return true
 	}
 
 	// matrix(1 0 0 1 0 0) — identity matrix
 	if name == "matrix" &&
-		len(data) >= 6 &&
-		data[0] == 1 &&
-		data[3] == 1 &&
-		data[1] == 0 &&
-		data[2] == 0 &&
-		data[4] == 0 &&
-		data[5] == 0 {
+		tools.JSIndex(data, 0) == 1 &&
+		tools.JSIndex(data, 3) == 1 &&
+		tools.JSFalsy(tools.JSIndex(data, 1)) &&
+		tools.JSFalsy(tools.JSIndex(data, 2)) &&
+		tools.JSFalsy(tools.JSIndex(data, 4)) &&
+		tools.JSFalsy(tools.JSIndex(data, 5)) {
 		return true
 	}
 

@@ -7,15 +7,55 @@ package tools
 
 import (
 	"encoding/base64"
-	"fmt"
 	"math"
+	"math/big"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/okooo5km/ogvs/internal/collections"
 	"github.com/okooo5km/ogvs/internal/svgast"
 )
+
+// JSRound rounds like JavaScript's Math.round: halves round toward +Infinity.
+// Go's math.Round rounds halves away from zero, which disagrees with JS for
+// negative X.5 values (e.g. -9124.5 → JS -9124 vs math.Round -9125) and can
+// cascade into structurally different path output.
+func JSRound(x float64) float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return x
+	}
+	return math.Floor(x + 0.5)
+}
+
+// JSIndex reads data[i] with JavaScript array semantics: an index past the end
+// yields undefined, which behaves as NaN in every arithmetic context SVGO uses.
+// Ports of SVGO code that destructures or indexes number arrays of unvalidated
+// length (transform data, in particular) must go through this so short input
+// produces NaN output instead of a panic.
+func JSIndex(data []float64, i int) float64 {
+	if i < 0 || i >= len(data) {
+		return math.NaN()
+	}
+	return data[i]
+}
+
+// JSFalsy reports whether v is falsy as a JavaScript number: 0, -0 and NaN are,
+// everything else is not. Pairs with JSIndex, since a missing element reads as
+// NaN and JavaScript treats undefined as falsy too.
+func JSFalsy(v float64) bool {
+	return v == 0 || math.IsNaN(v)
+}
+
+// JSOr mirrors the JavaScript `v || alt` idiom for numbers, substituting alt
+// whenever v is falsy.
+func JSOr(v, alt float64) float64 {
+	if JSFalsy(v) {
+		return alt
+	}
+	return v
+}
 
 var (
 	regReferencesURL   = regexp.MustCompile(`\burl\(["']?#(.+?)["']?\)`)
@@ -94,11 +134,76 @@ func RemoveLeadingZero(value float64) string {
 	return str
 }
 
-// ToFixed rounds a number to the specified precision.
-// Unlike fmt.Sprintf, this returns a float64.
+// ToFixed rounds a number to the specified precision, mirroring SVGO's
+// tools.toFixed (`Math.round(num * 10 ** precision) / 10 ** precision`).
+// Halves therefore round toward +Infinity: ToFixed(-2.5, 0) == -2.
+//
+// This is NOT the same function as JavaScript's Number.prototype.toFixed —
+// use NativeToFixed for ports of `x.toFixed(p)` call sites.
 func ToFixed(num float64, precision int) float64 {
 	pow := math.Pow(10, float64(precision))
-	return math.Round(num*pow) / pow
+	return JSRound(num*pow) / pow
+}
+
+// NativeToFixed rounds num to precision decimals exactly as JavaScript's
+// Number.prototype.toFixed followed by a numeric conversion does, i.e.
+// `Number(num.toFixed(precision))`. The decision is made on the exact binary
+// value of num and halves round away from zero:
+//
+//	NativeToFixed(-2.5, 0)    == -3   (ToFixed gives -2)
+//	NativeToFixed(-0.0025, 3) == -0.003
+//	NativeToFixed(1.005, 2)   == 1    (1.005 is below 1.005 as a double)
+//
+// Neither ToFixed (halves toward +Infinity) nor strconv.FormatFloat (halves to
+// even) can stand in for it. SVGO mixes both helpers, sometimes within one
+// function — smartRound in plugins/_transforms.js guards with tools.toFixed but
+// produces its values with the native method, and cleanupNumericValues /
+// cleanupListOfValues use the native method throughout. Each ported call site
+// must use the helper matching the JavaScript it mirrors.
+func NativeToFixed(num float64, precision int) float64 {
+	if num == 0 {
+		// toFixed drops the sign of -0: (-0).toFixed(2) is "0.00".
+		return 0
+	}
+	if math.IsNaN(num) || math.IsInf(num, 0) {
+		// Stringified as "NaN"/"Infinity", which convert straight back.
+		return num
+	}
+	if precision < 0 {
+		precision = 0
+	}
+	// From 1e21 up, toFixed falls back to Number.prototype.toString, so the
+	// round trip is lossless.
+	if math.Abs(num) >= 1e21 {
+		return num
+	}
+	if decimalPlaces(num) <= precision {
+		return num
+	}
+
+	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(precision)), nil)
+	scaled := new(big.Rat).SetFloat64(math.Abs(num))
+	scaled.Mul(scaled, new(big.Rat).SetInt(pow))
+	// floor(scaled + 1/2) on a non-negative value rounds halves up in
+	// magnitude, which is the tie-break toFixed specifies.
+	scaled.Add(scaled, big.NewRat(1, 2))
+	n := new(big.Int).Quo(scaled.Num(), scaled.Denom())
+	result, _ := new(big.Rat).SetFrac(n, pow).Float64()
+	if num < 0 {
+		result = -result
+	}
+	return result
+}
+
+// decimalPlaces returns the number of digits after the decimal point in the
+// shortest decimal representation that round-trips to f.
+func decimalPlaces(f float64) int {
+	str := strconv.FormatFloat(f, 'f', -1, 64)
+	dot := strings.IndexByte(str, '.')
+	if dot < 0 {
+		return 0
+	}
+	return len(str) - dot - 1
 }
 
 // HasScripts checks if a node contains any scripts.
@@ -212,18 +317,37 @@ func DecodeSVGDataURI(str string) string {
 	return str
 }
 
+// FormatNumber formats a float64 the way JavaScript's Number.prototype.toString()
+// does, which is what SVGO relies on for all numeric output.
+func FormatNumber(f float64) string {
+	return formatFloat(f)
+}
+
 // formatFloat formats a float64 to a string, removing trailing zeros.
 // Negative zero is normalized to positive zero to match JS behavior.
 func formatFloat(f float64) string {
 	// Normalize negative zero to positive zero
 	if f == 0 {
-		f = 0
+		return "0"
 	}
-	s := fmt.Sprintf("%g", f)
-	// Go's %g uses at least two digits for the exponent (e.g., "1e-07"),
-	// but JS uses minimal digits (e.g., "1e-7"). Strip leading zeros
-	// from the exponent to match JS behavior.
-	return stripExponentLeadingZeros(s)
+	// JS spells the infinities out; Go's strconv would emit "+Inf"/"-Inf".
+	if math.IsInf(f, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(f, -1) {
+		return "-Infinity"
+	}
+	// Match JS Number.prototype.toString(): decimal notation for the range
+	// [1e-6, 1e21), exponential outside it. Go's %g switches to exponential
+	// at a much lower magnitude (|v| >= 1e6), which corrupts large
+	// coordinates/viewBoxes and breaks SVGO byte-compatibility.
+	abs := math.Abs(f)
+	if abs < 1e-6 || abs >= 1e21 {
+		// Exponential; Go pads the exponent to two digits ("1e-07"),
+		// JS uses minimal digits ("1e-7") — strip the leading zeros.
+		return stripExponentLeadingZeros(strconv.FormatFloat(f, 'e', -1, 64))
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 // stripExponentLeadingZeros removes leading zeros from the exponent part

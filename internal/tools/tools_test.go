@@ -4,6 +4,7 @@
 package tools
 
 import (
+	"math"
 	"testing"
 
 	"github.com/okooo5km/ogvs/internal/svgast"
@@ -154,5 +155,114 @@ func TestHasScripts(t *testing.T) {
 	jsLink.Attributes.Set("href", "javascript:alert(1)")
 	if !HasScripts(jsLink) {
 		t.Error("HasScripts should return true for javascript: link")
+	}
+}
+
+func TestNativeToFixed(t *testing.T) {
+	// Expectations produced with node: Number(v.toFixed(p)).
+	tests := []struct {
+		num       float64
+		precision int
+		want      float64
+	}{
+		{-2.5, 0, -3},
+		{2.5, 0, 3},
+		{-1.5, 0, -2},
+		{-0.5, 0, -1},
+		{-0.0025, 3, -0.003},
+		{0.0025, 3, 0.003},
+		{1.005, 2, 1},
+		{-1.005, 2, -1},
+		{2.675, 2, 2.67},
+		{-2.675, 2, -2.67},
+		{8.835, 2, 8.84},
+		{-8.835, 2, -8.84},
+		{-0.0625, 3, -0.063},
+		{-1.0005, 3, -1},
+		{65.425, 2, 65.42},
+		{-79.015, 2, -79.02},
+		{12.754997, 3, 12.755},
+		{0.125, 2, 0.13},
+		{-0.125, 2, -0.13},
+		{9.995, 2, 9.99},
+		{1e-7, 3, 0},
+		{-1e-7, 3, 0},
+		{1e20, 0, 1e20},
+		{1e21, 0, 1e21},
+		{-1e21, 3, -1e21},
+		{0, 3, 0},
+		{-0, 3, 0},
+		{1, 5, 1},
+	}
+
+	for _, tt := range tests {
+		if got := NativeToFixed(tt.num, tt.precision); got != tt.want {
+			t.Errorf("NativeToFixed(%v, %d) = %v, want %v", tt.num, tt.precision, got, tt.want)
+		}
+	}
+
+	if got := NativeToFixed(math.NaN(), 3); !math.IsNaN(got) {
+		t.Errorf("NativeToFixed(NaN, 3) = %v, want NaN", got)
+	}
+	if got := NativeToFixed(math.Inf(-1), 3); !math.IsInf(got, -1) {
+		t.Errorf("NativeToFixed(-Inf, 3) = %v, want -Inf", got)
+	}
+
+	// ToFixed keeps Math.round semantics and must not follow NativeToFixed.
+	if got := ToFixed(-2.5, 0); got != -2 {
+		t.Errorf("ToFixed(-2.5, 0) = %v, want -2", got)
+	}
+	if got := ToFixed(-0.0025, 3); got != -0.002 {
+		t.Errorf("ToFixed(-0.0025, 3) = %v, want -0.002", got)
+	}
+}
+
+func TestJSIndexAndFalsy(t *testing.T) {
+	data := []float64{1, 0, math.NaN()}
+
+	if got := JSIndex(data, 0); got != 1 {
+		t.Errorf("JSIndex(data, 0) = %v, want 1", got)
+	}
+	if got := JSIndex(data, 3); !math.IsNaN(got) {
+		t.Errorf("JSIndex(data, 3) = %v, want NaN", got)
+	}
+	if got := JSIndex(nil, 0); !math.IsNaN(got) {
+		t.Errorf("JSIndex(nil, 0) = %v, want NaN", got)
+	}
+
+	for _, falsy := range []float64{0, -0, math.NaN()} {
+		if !JSFalsy(falsy) {
+			t.Errorf("JSFalsy(%v) = false, want true", falsy)
+		}
+	}
+	for _, truthy := range []float64{1, -1, 1e-9, math.Inf(1)} {
+		if JSFalsy(truthy) {
+			t.Errorf("JSFalsy(%v) = true, want false", truthy)
+		}
+	}
+
+	if got := JSOr(math.NaN(), 7); got != 7 {
+		t.Errorf("JSOr(NaN, 7) = %v, want 7", got)
+	}
+	if got := JSOr(3, 7); got != 3 {
+		t.Errorf("JSOr(3, 7) = %v, want 3", got)
+	}
+}
+
+func TestFormatNumberInfinity(t *testing.T) {
+	tests := []struct {
+		num  float64
+		want string
+	}{
+		{math.Inf(1), "Infinity"},
+		{math.Inf(-1), "-Infinity"},
+		{math.NaN(), "NaN"},
+		{-0, "0"},
+	}
+
+	for _, tt := range tests {
+		if got := FormatNumber(tt.num); got != tt.want {
+			t.Errorf("FormatNumber(%v) = %q, want %q", tt.num, got, tt.want)
+		}
 	}
 }

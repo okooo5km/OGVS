@@ -148,10 +148,14 @@ func supportPoint(polygon *hullPoint, direction vec2) vec2 {
 		}
 	}
 
+	// The dot product increases until the farthest point is reached, so a full
+	// lap around the hull is the hard upper bound on useful steps.
 	maxVal := math.Inf(-1)
-	for {
+	for steps := 0; steps <= len(polygon.list); steps++ {
 		value := vecDot(polygon.list[index], direction)
-		if value <= maxVal {
+		// Transcribes JS `while ((value = dot(...)) > max)`: a NaN value must
+		// end the walk, which `value <= maxVal` would not do.
+		if !(value > maxVal) {
 			break
 		}
 		maxVal = value
@@ -245,8 +249,12 @@ func vecSub(v1, v2 vec2) vec2 {
 }
 
 // vecDot returns the dot product of two vectors.
+// The explicit conversions round each product separately, as JavaScript does;
+// without them Go may contract the expression into a fused multiply-add whose
+// extra accuracy flips the sign of near-zero results and with it the outcome of
+// the collision predicates.
 func vecDot(v1, v2 vec2) float64 {
-	return v1[0]*v2[0] + v1[1]*v2[1]
+	return float64(v1[0]*v2[0]) + float64(v1[1]*v2[1])
 }
 
 // vecOrth returns a vector perpendicular to v, facing away from "from".
@@ -260,7 +268,7 @@ func vecOrth(v, from vec2) vec2 {
 
 // cross2D returns the cross product of vectors OA and OB.
 func cross2D(o, a, b vec2) float64 {
-	return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+	return float64((a[0]-o[0])*(b[1]-o[1])) - float64((a[1]-o[1])*(b[0]-o[0]))
 }
 
 // convertRelativeToAbsolute converts relative path commands to absolute.

@@ -197,3 +197,94 @@ func TestIsIdentityTransform(t *testing.T) {
 		}
 	}
 }
+
+func TestTransform2JS_TrailingChunks(t *testing.T) {
+	// Numbers after the last closing paren belong to the transform in progress,
+	// and a bare transform name outside parentheses invalidates the attribute.
+	got := Transform2JS("translate(10) 5 6")
+	if len(got) != 1 || got[0].Name != "translate" || len(got[0].Data) != 3 {
+		t.Fatalf("Transform2JS(%q) = %+v, want one translate with 3 values", "translate(10) 5 6", got)
+	}
+	if got[0].Data[1] != 5 || got[0].Data[2] != 6 {
+		t.Errorf("trailing data = %v, want [10 5 6]", got[0].Data)
+	}
+
+	if got := Transform2JS("translate(1) rotate"); got != nil {
+		t.Errorf("Transform2JS(%q) = %+v, want nil", "translate(1) rotate", got)
+	}
+}
+
+func TestTransform2JS_OutOfRangeValues(t *testing.T) {
+	// Number() saturates instead of failing, so all six arguments survive.
+	got := Transform2JS("matrix(1e400,0,0,1e400,0,1e-400)")
+	if len(got) != 1 {
+		t.Fatalf("Transform2JS = %+v, want one transform", got)
+	}
+	if len(got[0].Data) != 6 {
+		t.Fatalf("data = %v, want 6 values", got[0].Data)
+	}
+	if !math.IsInf(got[0].Data[0], 1) || !math.IsInf(got[0].Data[3], 1) {
+		t.Errorf("data = %v, want +Inf at 0 and 3", got[0].Data)
+	}
+	if got[0].Data[5] != 0 {
+		t.Errorf("data[5] = %v, want 0", got[0].Data[5])
+	}
+}
+
+func TestTransformsMultiply_ShortAndEmpty(t *testing.T) {
+	// Every result carries the six components consumers index unconditionally.
+	cases := [][]TransformItem{
+		nil,
+		{{Name: "matrix", Data: []float64{1}}},
+		{{Name: "matrix", Data: []float64{1, 2, 3}}},
+		{{Name: "matrix", Data: []float64{1}}, {Name: "matrix", Data: []float64{1}}},
+		{{Name: "translate", Data: nil}},
+		{{Name: "scale", Data: nil}, {Name: "rotate", Data: nil}},
+	}
+
+	for _, transforms := range cases {
+		got := TransformsMultiply(transforms)
+		if got.Name != "matrix" {
+			t.Errorf("TransformsMultiply(%+v).Name = %q, want matrix", transforms, got.Name)
+		}
+		if len(got.Data) < 6 {
+			t.Errorf("TransformsMultiply(%+v).Data = %v, want at least 6 values", transforms, got.Data)
+		}
+	}
+
+	// Extra components are not truncated.
+	long := TransformsMultiply([]TransformItem{{Name: "matrix", Data: []float64{1, 0, 0, 1, 0, 0, 9}}})
+	if len(long.Data) != 7 {
+		t.Errorf("Data = %v, want 7 values preserved", long.Data)
+	}
+}
+
+func TestMatrixToTransform_ShortMatrix(t *testing.T) {
+	params := &TransformParams{
+		FloatPrecision:     3,
+		TransformPrecision: 5,
+		LeadingZero:        true,
+	}
+
+	for _, data := range [][]float64{nil, {1}, {1, 2}, {1, 2, 3, 4, 5}} {
+		matrix := TransformItem{Name: "matrix", Data: data}
+		got := MatrixToTransform(&matrix, params)
+		if len(got) == 0 {
+			t.Errorf("MatrixToTransform(%v) returned nothing", data)
+		}
+		JS2Transform(got, params)
+	}
+}
+
+func TestSmartRound_NegativeHalfway(t *testing.T) {
+	// Values are produced with native toFixed semantics: halves away from zero.
+	if got := smartRound(3, []float64{-0.0625}); got[0] != -0.063 {
+		t.Errorf("smartRound(3, [-0.0625]) = %v, want -0.063", got[0])
+	}
+	if got := smartRound(2, []float64{65.425}); got[0] != 65.42 {
+		t.Errorf("smartRound(2, [65.425]) = %v, want 65.42", got[0])
+	}
+	if got := smartRound(2, []float64{-79.015}); got[0] != -79.02 {
+		t.Errorf("smartRound(2, [-79.015]) = %v, want -79.02", got[0])
+	}
+}

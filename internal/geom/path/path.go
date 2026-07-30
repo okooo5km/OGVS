@@ -7,7 +7,9 @@
 package path
 
 import (
+	"errors"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/okooo5km/ogvs/internal/tools"
@@ -138,90 +140,72 @@ func readNumber(s string, cursor int) (int, float64) {
 	return i - 1, number
 }
 
-// parseFloat parses a floating point number string, matching JS Number.parseFloat behavior.
+// parseFloat parses a floating point number string, matching JS
+// Number.parseFloat behavior: the longest leading substring that forms a
+// decimal literal is converted, and anything else yields NaN.
 func parseFloat(s string) float64 {
-	if s == "" {
+	end := decimalPrefixEnd(s)
+	if end == 0 {
 		return math.NaN()
 	}
-	var (
-		neg      bool
-		whole    int64
-		frac     float64
-		fracDiv  float64 = 1
-		hasDot   bool
-		hasDigit bool
-		exp      int64
-		expNeg   bool
-		hasExp   bool
-	)
+	value, err := strconv.ParseFloat(s[:end], 64)
+	if err != nil {
+		// Out-of-range magnitudes saturate to ±Inf / 0, which is what
+		// JS produces as well; anything else is not a number.
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && errors.Is(numErr.Err, strconv.ErrRange) {
+			return value
+		}
+		return math.NaN()
+	}
+	return value
+}
+
+// decimalPrefixEnd returns the length of the longest prefix of s that is a
+// decimal literal. Trailing fragments JS tolerates but strconv rejects — a
+// dangling exponent marker such as "1e" or "1e+" — are excluded, as are the
+// Go-only spellings (hex floats, digit separators, "Infinity", "NaN") that
+// JS parseFloat would not accept here.
+func decimalPrefixEnd(s string) int {
 	i := 0
 	if i < len(s) && (s[i] == '+' || s[i] == '-') {
-		neg = s[i] == '-'
 		i++
 	}
-	for ; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			whole = whole*10 + int64(s[i]-'0')
-			hasDigit = true
-		} else if s[i] == '.' {
-			hasDot = true
-			i++
-			break
-		} else if s[i] == 'e' || s[i] == 'E' {
-			hasExp = true
-			i++
-			goto parseExp
-		} else {
-			break
-		}
-	}
-	if hasDot {
-		for ; i < len(s); i++ {
-			if s[i] >= '0' && s[i] <= '9' {
-				frac = frac*10 + float64(s[i]-'0')
-				fracDiv *= 10
-				hasDigit = true
-			} else if s[i] == 'e' || s[i] == 'E' {
-				hasExp = true
-				i++
-				goto parseExp
-			} else {
-				break
-			}
-		}
-	}
-	if !hasDigit {
-		return math.NaN()
-	}
-	goto done
-
-parseExp:
-	if i < len(s) && (s[i] == '+' || s[i] == '-') {
-		expNeg = s[i] == '-'
+	intDigits := 0
+	for i < len(s) && isDigit(s[i]) {
 		i++
+		intDigits++
 	}
-	for ; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			exp = exp*10 + int64(s[i]-'0')
-		} else {
-			break
+	fracDigits := 0
+	if i < len(s) && s[i] == '.' {
+		j := i + 1
+		for j < len(s) && isDigit(s[j]) {
+			j++
+			fracDigits++
+		}
+		if intDigits != 0 || fracDigits != 0 {
+			i = j
 		}
 	}
-	_ = hasExp
-
-done:
-	result := float64(whole) + frac/fracDiv
-	if neg {
-		result = -result
+	if intDigits == 0 && fracDigits == 0 {
+		return 0
 	}
-	if exp != 0 {
-		if expNeg {
-			result /= math.Pow(10, float64(exp))
-		} else {
-			result *= math.Pow(10, float64(exp))
+	end := i
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		expDigits := 0
+		for j < len(s) && isDigit(s[j]) {
+			j++
+			expDigits++
+		}
+		if expDigits != 0 {
+			end = j
 		}
 	}
-	return result
+	return end
 }
 
 // ParsePathData parses an SVG path data string into a slice of PathDataItems.

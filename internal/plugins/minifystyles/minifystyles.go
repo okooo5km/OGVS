@@ -5,7 +5,6 @@
 package minifystyles
 
 import (
-	"regexp"
 	"strings"
 
 	"github.com/tdewolff/minify/v2"
@@ -85,24 +84,24 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 					deoptimized = true
 				}
 
-				// collect style elements
+				// collect usage data for every element, style elements
+				// included. Tag names are lowercased because csso matches
+				// type selectors case-insensitively.
+				usedTags[strings.ToLower(elem.Name)] = true
+				if classAttr, has := elem.Attributes.Get("class"); has {
+					for _, cls := range strings.Fields(classAttr) {
+						usedClasses[cls] = true
+					}
+				}
+				if idAttr, has := elem.Attributes.Get("id"); has && idAttr != "" {
+					usedIDs[idAttr] = true
+				}
+
+				// collect style elements or elements with a style attribute
 				if elem.Name == "style" && len(elem.Children) > 0 {
 					styleElements = append(styleElements, styleEntry{node: elem, parent: parent})
-				} else {
-					if elem.Attributes.Has("style") {
-						elementsWithStyleAttr = append(elementsWithStyleAttr, elem)
-					}
-
-					// collect usage data
-					usedTags[elem.Name] = true
-					if classAttr, has := elem.Attributes.Get("class"); has {
-						for _, cls := range strings.Fields(classAttr) {
-							usedClasses[cls] = true
-						}
-					}
-					if idAttr, has := elem.Attributes.Get("id"); has && idAttr != "" {
-						usedIDs[idAttr] = true
-					}
+				} else if elem.Attributes.Has("style") {
+					elementsWithStyleAttr = append(elementsWithStyleAttr, elem)
 				}
 
 				return nil
@@ -115,6 +114,12 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 
 				// Determine if we should remove unused selectors
 				removeUnused := usageEnabled && (!deoptimized || usage.force)
+				idx := &usageIndex{
+					tags:    usedTags,
+					classes: usedClasses,
+					ids:     usedIDs,
+					cfg:     usage,
+				}
 
 				// minify style elements
 				for _, entry := range styleElements {
@@ -143,8 +148,14 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 
 					// Then remove unused selectors
 					if removeUnused {
-						minified = removeUnusedRules(minified, usedTags, usedClasses, usedIDs, usage)
+						minified = removeUnusedRules(minified, idx)
 					}
+
+					minified = spaceAfterAtKeyword(minified)
+					if forms := attrFlagForms(cssText); len(forms) > 0 {
+						minified = separateAttrFlags(minified, forms)
+					}
+					minified = requoteFontFamilyKeywords(minified, cssText)
 
 					if minified == "" {
 						svgast.DetachNodeFromParent(entry.node, entry.parent)
@@ -173,6 +184,7 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 					minified = strings.TrimSuffix(minified, "}")
 					// Collapse longhand properties into shorthand
 					minified = collapseDeclarations(minified)
+					minified = requoteFontFamilyKeywords(minified, styleVal)
 					elem.Attributes.Set("style", minified)
 				}
 			},
@@ -180,123 +192,304 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 	}
 }
 
-// rulePattern matches CSS rules: selector { declarations }
-// This handles nested @-rules by matching balanced braces.
-var rulePattern = regexp.MustCompile(`([^{}]+)\{([^{}]*)\}`)
+// spaceAfterAtKeyword restores the space csso keeps between an at-rule name and
+// a parenthesised condition that follows it directly, as in "@media (min-width:1px)".
+// The tdewolff minifier drops that space. Quoted strings are stepped over so a
+// literal '@' inside one is left alone.
+func spaceAfterAtKeyword(cssText string) string {
+	var sb strings.Builder
+	i := 0
+	for i < len(cssText) {
+		ch := cssText[i]
+		switch {
+		case ch == '"' || ch == '\'':
+			quote := ch
+			sb.WriteByte(ch)
+			i++
+			for i < len(cssText) {
+				if cssText[i] == '\\' && i+1 < len(cssText) {
+					sb.WriteString(cssText[i : i+2])
+					i += 2
+					continue
+				}
+				sb.WriteByte(cssText[i])
+				i++
+				if cssText[i-1] == quote {
+					break
+				}
+			}
+		case ch == '@':
+			start := i
+			i++
+			for i < len(cssText) && isAtKeywordChar(cssText[i]) {
+				i++
+			}
+			sb.WriteString(cssText[start:i])
+			if i > start+1 && i < len(cssText) && cssText[i] == '(' {
+				sb.WriteByte(' ')
+			}
+		default:
+			sb.WriteByte(ch)
+			i++
+		}
+	}
+	return sb.String()
+}
 
-// removeUnusedRules removes CSS rules whose selectors don't match any used elements.
-func removeUnusedRules(cssText string, usedTags, usedClasses, usedIDs map[string]bool, usage usageConfig) string {
-	var result strings.Builder
-	remaining := cssText
+// reservedFontFamilies are the identifiers that name something other than a font
+// family: the CSS-wide keywords and the generic family names. A family whose name
+// is spelled like one of them is only reachable while it stays quoted.
+var reservedFontFamilies = map[string]bool{
+	"inherit": true, "initial": true, "unset": true, "revert": true,
+	"revert-layer": true, "default": true, "none": true,
+	"serif": true, "sans-serif": true, "monospace": true, "cursive": true,
+	"fantasy": true, "system-ui": true, "math": true, "emoji": true,
+	"fangsong": true, "ui-serif": true, "ui-sans-serif": true,
+	"ui-monospace": true, "ui-rounded": true,
+}
 
-	for len(remaining) > 0 {
-		// Find next rule or @-rule
-		if strings.HasPrefix(remaining, "@") {
-			// @-rule: find matching braces
-			atRule, rest := extractAtRule(remaining)
-			result.WriteString(atRule)
-			remaining = rest
+// requoteFontFamilyKeywords puts back the quotes on a font-family value that
+// names a family after a CSS-wide keyword or a generic family. The tdewolff CSS
+// minifier unquotes and lowercases such a value, which turns "the font called
+// inherit" into the inherit keyword. original is the CSS as it was before
+// minification; a keyword the source also uses bare is left untouched, since
+// there the bare form really is the keyword.
+func requoteFontFamilyKeywords(minified, original string) string {
+	quoted := make(map[string]string)
+	bare := make(map[string]bool)
+	forEachFontFamilyValue(original, func(value string) {
+		if inner, ok := wholeQuotedString(value); ok {
+			lower := strings.ToLower(inner)
+			if reservedFontFamilies[lower] {
+				quoted[lower] = `"` + inner + `"`
+			}
+			return
+		}
+		if reservedFontFamilies[strings.ToLower(value)] {
+			bare[strings.ToLower(value)] = true
+		}
+	})
+	for name := range bare {
+		delete(quoted, name)
+	}
+	if len(quoted) == 0 {
+		return minified
+	}
+
+	var sb strings.Builder
+	prev := 0
+	forEachFontFamilyValueAt(minified, func(start, end int) {
+		replacement, ok := quoted[strings.ToLower(minified[start:end])]
+		if !ok {
+			return
+		}
+		sb.WriteString(minified[prev:start])
+		sb.WriteString(replacement)
+		prev = end
+	})
+	if prev == 0 {
+		return minified
+	}
+	sb.WriteString(minified[prev:])
+	return sb.String()
+}
+
+// wholeQuotedString reports the content of value when value is nothing but a
+// single quoted string.
+func wholeQuotedString(value string) (string, bool) {
+	if len(value) < 2 {
+		return "", false
+	}
+	quote := value[0]
+	if quote != '"' && quote != '\'' {
+		return "", false
+	}
+	if skipCSSString(value, 0) != len(value) || value[len(value)-1] != quote {
+		return "", false
+	}
+	return value[1 : len(value)-1], true
+}
+
+func forEachFontFamilyValue(cssText string, fn func(value string)) {
+	forEachFontFamilyValueAt(cssText, func(start, end int) {
+		fn(cssText[start:end])
+	})
+}
+
+// forEachFontFamilyValueAt reports the bounds of the value of every font-family
+// declaration in cssText, with surrounding whitespace trimmed off.
+func forEachFontFamilyValueAt(cssText string, fn func(start, end int)) {
+	const prop = "font-family"
+	for i := 0; i+len(prop) < len(cssText); i++ {
+		if !strings.EqualFold(cssText[i:i+len(prop)], prop) {
 			continue
 		}
-
-		// Find next rule: selector { declarations }
-		loc := rulePattern.FindStringIndex(remaining)
-		if loc == nil {
-			result.WriteString(remaining)
-			break
-		}
-
-		// Include any text before the match
-		if loc[0] > 0 {
-			result.WriteString(remaining[:loc[0]])
-		}
-
-		match := remaining[loc[0]:loc[1]]
-		braceIdx := strings.Index(match, "{")
-		selector := strings.TrimSpace(match[:braceIdx])
-		declarations := match[braceIdx:]
-
-		if isSelectorUsed(selector, usedTags, usedClasses, usedIDs, usage) {
-			result.WriteString(selector)
-			result.WriteString(declarations)
-		}
-
-		remaining = remaining[loc[1]:]
-	}
-
-	return result.String()
-}
-
-// extractAtRule extracts an @-rule with its balanced braces.
-func extractAtRule(s string) (string, string) {
-	depth := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '{' {
-			depth++
-		} else if s[i] == '}' {
-			depth--
-			if depth == 0 {
-				return s[:i+1], s[i+1:]
-			}
-		}
-	}
-	return s, ""
-}
-
-// isSelectorUsed checks if a CSS selector matches any used element.
-func isSelectorUsed(selector string, usedTags, usedClasses, usedIDs map[string]bool, usage usageConfig) bool {
-	// Handle comma-separated selectors: each must be checked
-	parts := strings.Split(selector, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+		if i > 0 && isAtKeywordChar(cssText[i-1]) {
 			continue
 		}
-		if isSingleSelectorUsed(part, usedTags, usedClasses, usedIDs, usage) {
-			return true
+		j := i + len(prop)
+		for j < len(cssText) && isCSSSpaceByte(cssText[j]) {
+			j++
 		}
+		if j >= len(cssText) || cssText[j] != ':' {
+			continue
+		}
+		j++
+		for j < len(cssText) && isCSSSpaceByte(cssText[j]) {
+			j++
+		}
+		start := j
+		for j < len(cssText) && cssText[j] != ';' && cssText[j] != '}' {
+			if cssText[j] == '"' || cssText[j] == '\'' {
+				j = skipCSSString(cssText, j)
+				continue
+			}
+			j++
+		}
+		end := j
+		for end > start && isCSSSpaceByte(cssText[end-1]) {
+			end--
+		}
+		if end > start {
+			fn(start, end)
+		}
+		i = j - 1
 	}
-	return false
 }
 
-// isSingleSelectorUsed checks if a single (non-comma) selector is used.
-func isSingleSelectorUsed(selector string, usedTags, usedClasses, usedIDs map[string]bool, usage usageConfig) bool {
-	// Check for class selectors: .className
-	if usage.classes {
-		classRe := regexp.MustCompile(`\.([a-zA-Z_-][\w-]*)`)
-		matches := classRe.FindAllStringSubmatch(selector, -1)
-		for _, m := range matches {
-			if !usedClasses[m[1]] {
-				return false
+// attrFlagForms collects the "<name><op><value><flag>" spellings, with the
+// separating whitespace removed, of every attribute selector in cssText that
+// carries an explicit 's' or 'S' case-sensitivity flag. Both the quoted and the
+// unquoted form of the value are recorded, because the minifier drops redundant
+// quotes. An empty result means the sheet uses no such flag.
+func attrFlagForms(cssText string) map[string]bool {
+	var forms map[string]bool
+	forEachAttrSelector(cssText, func(start, end int) {
+		content := strings.TrimRight(cssText[start:end], " \t\n\r\f")
+		if len(content) < 2 {
+			return
+		}
+		flag := content[len(content)-1]
+		if flag != 's' && flag != 'S' {
+			return
+		}
+		value := strings.TrimRight(content[:len(content)-1], " \t\n\r\f")
+		if len(value) == len(content)-1 {
+			// Nothing separated the trailing letter from the value, so it is
+			// part of the value rather than a flag.
+			return
+		}
+		if forms == nil {
+			forms = make(map[string]bool)
+		}
+		forms[value+string(flag)] = true
+		if unquoted, ok := unquoteAttrValue(value); ok {
+			forms[unquoted+string(flag)] = true
+		}
+	})
+	return forms
+}
+
+// separateAttrFlags reinstates the space between an attribute selector's value
+// and its case-sensitivity flag. The tdewolff CSS minifier recognises only the
+// 'i' flag, so an 's' flag comes out glued to the value and the selector then
+// tests for a different value. Only the spellings in forms are touched.
+func separateAttrFlags(cssText string, forms map[string]bool) string {
+	var positions []int
+	forEachAttrSelector(cssText, func(start, end int) {
+		content := cssText[start:end]
+		if len(content) < 2 || isCSSSpaceByte(content[len(content)-2]) {
+			return
+		}
+		if forms[content] {
+			positions = append(positions, end-1)
+		}
+	})
+	if len(positions) == 0 {
+		return cssText
+	}
+	var sb strings.Builder
+	prev := 0
+	for _, pos := range positions {
+		sb.WriteString(cssText[prev:pos])
+		sb.WriteByte(' ')
+		prev = pos
+	}
+	sb.WriteString(cssText[prev:])
+	return sb.String()
+}
+
+// unquoteAttrValue strips the quotes from a "<name><op>" prefix whose value is a
+// quoted string, reporting whether the input ended in one.
+func unquoteAttrValue(s string) (string, bool) {
+	if len(s) < 2 {
+		return s, false
+	}
+	quote := s[len(s)-1]
+	if quote != '"' && quote != '\'' {
+		return s, false
+	}
+	open := strings.LastIndexByte(s[:len(s)-1], quote)
+	if open < 0 {
+		return s, false
+	}
+	return s[:open] + s[open+1:len(s)-1], true
+}
+
+// forEachAttrSelector reports the bounds of the content of every attribute
+// selector in cssText, stepping over quoted strings so brackets inside one are
+// not mistaken for selector delimiters.
+func forEachAttrSelector(cssText string, fn func(start, end int)) {
+	i := 0
+	for i < len(cssText) {
+		switch cssText[i] {
+		case '"', '\'':
+			i = skipCSSString(cssText, i)
+		case '[':
+			start := i + 1
+			j := start
+			for j < len(cssText) && cssText[j] != ']' {
+				if cssText[j] == '"' || cssText[j] == '\'' {
+					j = skipCSSString(cssText, j)
+					continue
+				}
+				j++
 			}
+			if j >= len(cssText) {
+				return
+			}
+			fn(start, j)
+			i = j + 1
+		default:
+			i++
 		}
 	}
+}
 
-	// Check for ID selectors: #idName
-	if usage.ids {
-		idRe := regexp.MustCompile(`#([a-zA-Z_-][\w-]*)`)
-		matches := idRe.FindAllStringSubmatch(selector, -1)
-		for _, m := range matches {
-			if !usedIDs[m[1]] {
-				return false
-			}
+// skipCSSString returns the offset just past the quoted string starting at s[i].
+func skipCSSString(s string, i int) int {
+	quote := s[i]
+	i++
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			i += 2
+			continue
 		}
-	}
-
-	// Check for tag selectors (simple element names)
-	if usage.tags {
-		// Extract tag names: tokens that aren't preceded by . or # and aren't pseudo-classes
-		tagRe := regexp.MustCompile(`(?:^|[\s>+~])([a-zA-Z][\w-]*)`)
-		matches := tagRe.FindAllStringSubmatch(selector, -1)
-		for _, m := range matches {
-			tagName := m[1]
-			if !usedTags[tagName] {
-				return false
-			}
+		if s[i] == quote {
+			return i + 1
 		}
+		i++
 	}
+	return i
+}
 
-	return true
+func isCSSSpaceByte(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f'
+}
+
+func isAtKeywordChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch >= 0x80
 }
 
 // shorthandGroup defines a CSS shorthand property and its longhands in top/right/bottom/left order.

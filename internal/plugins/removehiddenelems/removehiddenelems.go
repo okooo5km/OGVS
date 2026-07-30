@@ -196,7 +196,11 @@ func fn(root *svgast.Root, params map[string]any, _ *plugin.PluginInfo) *svgast.
 							continue
 						}
 						value := entry.Value
-						id := value[1:] // strip leading '#'
+						// Match JS `value.slice(1)`: empty string yields "" (no panic).
+						var id string
+						if len(value) > 0 {
+							id = value[1:] // strip leading '#'
+						}
 
 						referencesById[id] = append(referencesById[id], useRef{elem, parent})
 					}

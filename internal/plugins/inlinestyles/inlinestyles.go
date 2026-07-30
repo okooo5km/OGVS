@@ -27,13 +27,25 @@ type styleInfo struct {
 	node    *svgast.Element
 	parent  svgast.Parent
 	cssText string // raw CSS text from this style element
+	// mediaQuery is the media query the element's own media attribute imposes
+	// on its top-level rules; empty for an unconditional style element.
+	mediaQuery string
 }
 
 type selectorInfo struct {
 	selector         string // cleaned selector (no pseudo-classes), for matching
 	originalSelector string // original selector (with pseudo-classes), for CSS output
+	mediaQuery       string // media query context the rule was collected under
 	specificity      ogcss.Specificity
 	rule             ogcss.StylesheetRule
+}
+
+// appliedKey identifies a rule by both its selector text and its media query
+// context. Selector text alone is ambiguous: the same selector may appear both
+// at the top level and inside an at-rule, and only the top-level one is ever
+// inlined.
+func appliedKey(mediaQuery, selector string) string {
+	return mediaQuery + "|" + selector
 }
 
 // styledDecl represents a single CSS declaration with order tracking.
@@ -139,9 +151,10 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 				// Also check: even if no rules are processable, the style element
 				// might contain at-rules that need to be compacted
 				styles = append(styles, styleInfo{
-					node:    elem,
-					parent:  parent,
-					cssText: cssText.String(),
+					node:       elem,
+					parent:     parent,
+					cssText:    cssText.String(),
+					mediaQuery: defaultMediaQuery,
 				})
 
 				if !hasProcessable {
@@ -163,6 +176,7 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 					si := selectorInfo{
 						selector:         rule.Selector,
 						originalSelector: rule.OriginalSelector,
+						mediaQuery:       mq,
 						specificity:      rule.Specificity,
 						rule:             rule,
 					}
@@ -206,10 +220,15 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 				// Track which selectors were applied (by original selector string)
 				appliedSelectors := make(map[int]bool)
 				appliedOrigSelectors := make(map[string]bool) // for CompactStylesheet
+				// Elements each applied selector matched, captured before any
+				// class or id attribute is cleaned up.
+				matchedElements := make(map[int][]*svgast.Element)
 
 				for idx, sel := range sorted {
-					matched := ogcss.QuerySelectorAll(root, sel.selector, parents)
-					if len(matched) == 0 {
+					// SVGO wraps querySelectorAll in try/catch and skips the
+					// selector when css-select throws.
+					matched, ok := ogcss.QuerySelectorAllErr(root, sel.selector, parents)
+					if !ok || len(matched) == 0 {
 						continue
 					}
 
@@ -223,41 +242,32 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 					}
 
 					appliedSelectors[idx] = true
-					appliedOrigSelectors[sel.originalSelector] = true
+					appliedOrigSelectors[appliedKey(sel.mediaQuery, sel.originalSelector)] = true
+					matchedElements[idx] = matched
 				}
 
 				if !removeMatchedSelectors {
 					return
 				}
 
-				// Use CompactStylesheet to generate remaining CSS
-				// This preserves at-rules and handles comma-separated selector groups
-				shouldSkip := func(selector, mediaQuery string) bool {
-					return appliedOrigSelectors[selector]
-				}
-
-				// Combine all CSS from all style elements
-				var allCSS strings.Builder
+				// Rewrite each style element from its own CSS so element
+				// boundaries, media attributes and CDATA framing survive.
+				// CompactStylesheet preserves at-rules and handles
+				// comma-separated selector groups.
 				for _, style := range styles {
-					allCSS.WriteString(style.cssText)
-				}
-
-				css := ogcss.CompactStylesheet(allCSS.String(), shouldSkip)
-
-				if css == "" {
-					// Remove all style elements
-					for _, style := range styles {
-						svgast.DetachNodeFromParent(style.node, style.parent)
-					}
-				} else {
-					// Update first style element, remove the rest
-					for i, style := range styles {
-						if i == 0 {
-							style.node.Children = []svgast.Node{&svgast.Text{Value: css}}
-						} else {
-							svgast.DetachNodeFromParent(style.node, style.parent)
+					shouldSkip := func(selector, mediaQuery string) bool {
+						if mediaQuery == "" {
+							mediaQuery = style.mediaQuery
 						}
+						return appliedOrigSelectors[appliedKey(mediaQuery, selector)]
 					}
+
+					css := ogcss.CompactStylesheet(style.cssText, shouldSkip)
+					if css == "" {
+						svgast.DetachNodeFromParent(style.node, style.parent)
+						continue
+					}
+					setStyleText(style.node, css)
 				}
 
 				// Collect all remaining selectors for attribute reference checks
@@ -273,15 +283,32 @@ func fn(root *svgast.Root, params map[string]any, info *plugin.PluginInfo) *svga
 					if !appliedSelectors[idx] {
 						continue
 					}
-					matched := ogcss.QuerySelectorAll(root, sel.selector, parents)
-					for _, elem := range matched {
-						cleanupClassAndID(elem, sorted, appliedSelectors)
+					for _, elem := range matchedElements[idx] {
+						cleanupClassAndID(elem, sel, sorted)
 						cleanupPresentationAttrs(elem, remainingSelectors)
 					}
 				}
 			},
 		},
 	}
+}
+
+// setStyleText writes css back into a <style> element, keeping the first child's
+// existing node kind so a CDATA section stays a CDATA section.
+func setStyleText(elem *svgast.Element, css string) {
+	if len(elem.Children) > 0 {
+		switch c := elem.Children[0].(type) {
+		case *svgast.Cdata:
+			c.Value = css
+			elem.Children = elem.Children[:1]
+			return
+		case *svgast.Text:
+			c.Value = css
+			elem.Children = elem.Children[:1]
+			return
+		}
+	}
+	elem.Children = []svgast.Node{&svgast.Text{Value: css}}
 }
 
 // mergeDeclarationsIntoElement merges CSS rule declarations into an element's
@@ -377,7 +404,8 @@ func extractPseudo(selector string) string {
 				i++ // skip the second colon
 				// Skip the pseudo-element name
 				for i+1 < len(selector) && selector[i+1] != ' ' && selector[i+1] != ':' &&
-					selector[i+1] != '.' && selector[i+1] != '#' && selector[i+1] != '[' {
+					selector[i+1] != '.' && selector[i+1] != '#' && selector[i+1] != '[' &&
+					selector[i+1] != '>' && selector[i+1] != '+' && selector[i+1] != '~' {
 					i++
 				}
 				continue
@@ -386,7 +414,8 @@ func extractPseudo(selector string) string {
 			end := i + 1
 			for end < len(selector) && selector[end] != ' ' && selector[end] != ':' &&
 				selector[end] != '.' && selector[end] != '#' && selector[end] != '[' &&
-				selector[end] != ')' {
+				selector[end] != ')' && selector[end] != '>' && selector[end] != '+' &&
+				selector[end] != '~' {
 				end++
 			}
 			// Include closing paren if present (e.g., :nth-child(2n))
@@ -399,55 +428,91 @@ func extractPseudo(selector string) string {
 	return ""
 }
 
-// cleanupClassAndID removes class and ID attributes that are no longer needed.
-func cleanupClassAndID(elem *svgast.Element, allSelectors []selectorInfo, applied map[int]bool) {
-	// Clean up class attribute
-	classAttr, _ := elem.Attributes.Get("class")
-	if classAttr != "" {
-		classes := strings.Fields(classAttr)
-		var remaining []string
-		for _, cls := range classes {
-			needed := false
-			// Check if any unapplied selector still needs this class
-			for idx, sel := range allSelectors {
-				if applied[idx] {
-					continue
-				}
-				if strings.Contains(sel.selector, "."+cls) || strings.Contains(sel.originalSelector, "."+cls) {
-					needed = true
-					break
-				}
-			}
-			if needed {
-				remaining = append(remaining, cls)
-			}
-		}
+// cleanupClassAndID drops the class and id attribute values that sel consumed
+// while matching elem. Only the sub-selectors of sel itself are considered:
+// class names the selector never mentioned survive, and so does anything some
+// selector in the sheet still reaches through an attribute selector.
+//
+// sel.selector is used rather than sel.originalSelector because SVGO walks the
+// selector AST after the non-evaluatable pseudo-classes have been spliced out
+// of it, which is exactly what selector holds.
+func cleanupClassAndID(elem *svgast.Element, sel selectorInfo, allSelectors []selectorInfo) {
+	// class
+	classAttr, hasClass := elem.Attributes.Get("class")
+	classList := newClassList(classAttr, hasClass)
 
-		if len(remaining) == 0 {
-			elem.Attributes.Delete("class")
-		} else {
-			elem.Attributes.Set("class", strings.Join(remaining, " "))
+	for _, name := range ogcss.SelectorClassNames(sel.selector) {
+		if referencedByAttrSelector(allSelectors, "class", name) {
+			continue
 		}
+		classList.delete(name)
 	}
 
-	// Clean up id attribute
-	idAttr, hasID := elem.Attributes.Get("id")
-	if hasID && idAttr != "" {
-		needed := false
-		for idx, sel := range allSelectors {
-			if applied[idx] {
-				continue
-			}
-			if strings.Contains(sel.selector, "#"+idAttr) || strings.Contains(sel.originalSelector, "#"+idAttr) {
-				needed = true
-				break
-			}
-		}
-		if !needed {
+	if classList.len() == 0 {
+		elem.Attributes.Delete("class")
+	} else {
+		elem.Attributes.Set("class", classList.join())
+	}
+
+	// id
+	if name, ok := ogcss.SelectorLeadingID(sel.selector); ok {
+		if id, hasID := elem.Attributes.Get("id"); hasID && id == name &&
+			!referencedByAttrSelector(allSelectors, "id", name) {
 			elem.Attributes.Delete("id")
 		}
 	}
 }
+
+// referencedByAttrSelector reports whether any collected selector reaches the
+// given attribute value through a segment that is followed by a combinator,
+// which means removing the value would break that selector.
+func referencedByAttrSelector(selectors []selectorInfo, name, value string) bool {
+	for _, sel := range selectors {
+		if ogcss.SelectorIncludesAttr(sel.selector, name, &value, true) {
+			return true
+		}
+	}
+	return false
+}
+
+// classList is the ordered set SVGO builds from a class attribute by splitting
+// it on single spaces.
+type classList struct {
+	order []string
+	seen  map[string]bool
+}
+
+func newClassList(value string, present bool) *classList {
+	cl := &classList{seen: make(map[string]bool)}
+	if !present {
+		return cl
+	}
+	for _, name := range strings.Split(value, " ") {
+		if cl.seen[name] {
+			continue
+		}
+		cl.seen[name] = true
+		cl.order = append(cl.order, name)
+	}
+	return cl
+}
+
+func (cl *classList) delete(name string) {
+	if !cl.seen[name] {
+		return
+	}
+	delete(cl.seen, name)
+	for i, n := range cl.order {
+		if n == name {
+			cl.order = append(cl.order[:i], cl.order[i+1:]...)
+			break
+		}
+	}
+}
+
+func (cl *classList) len() int { return len(cl.order) }
+
+func (cl *classList) join() string { return strings.Join(cl.order, " ") }
 
 // buildParentMap builds a parent map for the entire tree.
 func buildParentMap(root *svgast.Root) map[svgast.Node]svgast.Parent {

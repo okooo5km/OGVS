@@ -6,8 +6,6 @@
 package cleanuplistofvalues
 
 import (
-	"fmt"
-	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -76,13 +74,13 @@ func fn(_ *svgast.Root, params map[string]any, _ *plugin.PluginInfo) *svgast.Vis
 					continue
 				}
 
-				num := tools.ToFixed(numVal, floatPrecision)
+				num := tools.NativeToFixed(numVal, floatPrecision)
 				units := match[3]
 
 				// Convert absolute units to px
 				if convertToPx && units != "" {
 					if factor, ok := absoluteLengths[units]; ok {
-						pxNum := tools.ToFixed(factor*numVal, floatPrecision)
+						pxNum := tools.NativeToFixed(factor*numVal, floatPrecision)
 						pxStr := formatNum(pxNum)
 						if len(pxStr) < len(match[0]) {
 							num = pxNum
@@ -133,9 +131,7 @@ func fn(_ *svgast.Root, params map[string]any, _ *plugin.PluginInfo) *svgast.Vis
 }
 
 // formatNum formats a float64 to string.
+// Uses JS Number.toString() semantics so large values stay in decimal notation.
 func formatNum(f float64) string {
-	if f == math.Trunc(f) && !math.IsInf(f, 0) {
-		return fmt.Sprintf("%g", f)
-	}
-	return fmt.Sprintf("%g", f)
+	return tools.FormatNumber(f)
 }

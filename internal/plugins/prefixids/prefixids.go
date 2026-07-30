@@ -126,6 +126,7 @@ func rewriteCSSTokens(cssText string, prefixGen func(string) string, prefixIDs, 
 
 // rewriteBlock processes a CSS block (top-level or nested within at-rules).
 func rewriteBlock(w *strings.Builder, p *css.Parser, prefixGen func(string) string, prefixIDs, prefixClassNames bool, nested bool) {
+	firstDecl := true
 	for {
 		gt, _, data := p.Next()
 		if gt == css.ErrorGrammar {
@@ -172,8 +173,19 @@ func rewriteBlock(w *strings.Builder, p *css.Parser, prefixGen func(string) stri
 			}
 
 		case css.DeclarationGrammar:
-			// Standalone declarations (shouldn't happen at top level, but handle for safety)
+			// Declarations inside at-rule blocks like @font-face and @page
+			if !firstDecl {
+				w.WriteString(";")
+			}
+			firstDecl = false
 			writeDeclaration(w, string(data), p.Values(), prefixGen)
+
+		case css.CustomPropertyGrammar:
+			if !firstDecl {
+				w.WriteString(";")
+			}
+			firstDecl = false
+			writeCustomProperty(w, string(data), p.Values())
 		}
 	}
 }
@@ -203,12 +215,19 @@ func rewriteKeyframesAtRule(w *strings.Builder, p *css.Parser, name string, valu
 				if dgt == css.ErrorGrammar || dgt == css.EndRulesetGrammar || dgt == css.EndAtRuleGrammar {
 					break
 				}
-				if dgt == css.DeclarationGrammar {
+				switch dgt {
+				case css.DeclarationGrammar:
 					if !firstDecl {
 						w.WriteString(";")
 					}
 					firstDecl = false
 					writeDeclaration(w, string(ddata), p.Values(), prefixGen)
+				case css.CustomPropertyGrammar:
+					if !firstDecl {
+						w.WriteString(";")
+					}
+					firstDecl = false
+					writeCustomProperty(w, string(ddata), p.Values())
 				}
 			}
 			w.WriteString("}")
@@ -227,12 +246,19 @@ func rewriteRuleset(w *strings.Builder, p *css.Parser, selectorStr string, prefi
 		if gt == css.ErrorGrammar || gt == css.EndRulesetGrammar || gt == css.EndAtRuleGrammar {
 			break
 		}
-		if gt == css.DeclarationGrammar {
+		switch gt {
+		case css.DeclarationGrammar:
 			if !firstDecl {
 				declBuf.WriteString(";")
 			}
 			firstDecl = false
 			writeDeclaration(&declBuf, string(data), p.Values(), prefixGen)
+		case css.CustomPropertyGrammar:
+			if !firstDecl {
+				declBuf.WriteString(";")
+			}
+			firstDecl = false
+			writeCustomProperty(&declBuf, string(data), p.Values())
 		}
 	}
 
@@ -452,6 +478,19 @@ func writeDeclaration(w *strings.Builder, name string, values []css.Token, prefi
 	if important {
 		w.WriteString("!important")
 	}
+}
+
+// writeCustomProperty writes a compact custom property declaration. tdewolff
+// reports these through CustomPropertyGrammar with a single raw value token,
+// which is emitted verbatim.
+func writeCustomProperty(w *strings.Builder, name string, values []css.Token) {
+	w.WriteString(strings.TrimSpace(name))
+	w.WriteString(":")
+	var raw strings.Builder
+	for _, v := range values {
+		raw.WriteString(string(v.Data))
+	}
+	w.WriteString(strings.TrimSpace(raw.String()))
 }
 
 // isKeyframesAtRule checks if an at-rule name is a keyframes rule.

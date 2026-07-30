@@ -25,9 +25,10 @@ func CompactStylesheet(cssText string, shouldSkip func(selector, mediaQuery stri
 // compactBlock processes a CSS block (top-level or inside an at-rule).
 func compactBlock(p *css.Parser, w *strings.Builder, shouldSkip func(string, string) bool, mediaQuery string, nested bool) {
 	firstDecl := true
+	var raw rawTokenState
 
 	for {
-		gt, _, data := p.Next()
+		gt, tt, data := p.Next()
 		if gt == css.ErrorGrammar {
 			break
 		}
@@ -68,6 +69,18 @@ func compactBlock(p *css.Parser, w *strings.Builder, shouldSkip func(string, str
 			}
 			firstDecl = false
 			compactDeclaration(w, string(data), p.Values())
+
+		case css.CustomPropertyGrammar:
+			if !firstDecl {
+				w.WriteString(";")
+			}
+			firstDecl = false
+			compactCustomProperty(w, string(data), p.Values())
+
+		case css.TokenGrammar:
+			// At-rules the parser has no model for (@container, @scope,
+			// @starting-style) surface their whole body as a raw token stream.
+			raw.write(w, tt, data)
 		}
 	}
 }
@@ -110,12 +123,19 @@ func compactKeyframesAtRule(p *css.Parser, w *strings.Builder, name string, valu
 				if dgt == css.ErrorGrammar || dgt == css.EndRulesetGrammar || dgt == css.EndAtRuleGrammar {
 					break
 				}
-				if dgt == css.DeclarationGrammar {
+				switch dgt {
+				case css.DeclarationGrammar:
 					if !firstDecl {
 						w.WriteString(";")
 					}
 					firstDecl = false
 					compactDeclaration(w, string(ddata), p.Values())
+				case css.CustomPropertyGrammar:
+					if !firstDecl {
+						w.WriteString(";")
+					}
+					firstDecl = false
+					compactCustomProperty(w, string(ddata), p.Values())
 				}
 			}
 			w.WriteString("}")
@@ -141,13 +161,20 @@ func compactDeclarationAtRule(p *css.Parser, w *strings.Builder, name string, va
 		if gt == css.ErrorGrammar || gt == css.EndRulesetGrammar || gt == css.EndAtRuleGrammar {
 			break
 		}
-		if gt == css.DeclarationGrammar {
+		switch gt {
+		case css.DeclarationGrammar:
 			if !firstDecl {
 				w.WriteString(";")
 			}
 			firstDecl = false
 			compactDeclaration(w, string(data), p.Values())
-		} else if gt == css.TokenGrammar {
+		case css.CustomPropertyGrammar:
+			if !firstDecl {
+				w.WriteString(";")
+			}
+			firstDecl = false
+			compactCustomProperty(w, string(data), p.Values())
+		case css.TokenGrammar:
 			// Raw token fallback for at-rules the parser doesn't understand (e.g., @viewport)
 			rawTokens = append(rawTokens, string(data))
 		}
@@ -201,12 +228,19 @@ func compactRuleset(p *css.Parser, w *strings.Builder, selectorStr string,
 		if gt == css.ErrorGrammar || gt == css.EndRulesetGrammar || gt == css.EndAtRuleGrammar {
 			break
 		}
-		if gt == css.DeclarationGrammar {
+		switch gt {
+		case css.DeclarationGrammar:
 			if !firstDecl {
 				declBuf.WriteString(";")
 			}
 			firstDecl = false
 			compactDeclaration(&declBuf, string(data), p.Values())
+		case css.CustomPropertyGrammar:
+			if !firstDecl {
+				declBuf.WriteString(";")
+			}
+			firstDecl = false
+			compactCustomProperty(&declBuf, string(data), p.Values())
 		}
 	}
 
@@ -232,38 +266,68 @@ func compactRuleset(p *css.Parser, w *strings.Builder, selectorStr string,
 }
 
 // compactSelector builds a compact selector string from data and values.
+// The tokenizer discards the whitespace inside an attribute selector, so the
+// space that separates a value from a following case-sensitivity flag is put
+// back: without it the flag would read as part of the value.
 func compactSelector(data string, values []css.Token) string {
 	var sb strings.Builder
 	sb.WriteString(strings.TrimSpace(data))
+
+	inAttr := false
+	valueSeen := false
 	for _, v := range values {
+		switch v.TokenType {
+		case css.LeftBracketToken:
+			inAttr = true
+			valueSeen = false
+		case css.RightBracketToken:
+			inAttr = false
+			valueSeen = false
+		case css.IdentToken, css.StringToken, css.NumberToken, css.DimensionToken:
+			if inAttr {
+				if valueSeen {
+					sb.WriteByte(' ')
+				}
+				valueSeen = true
+			}
+		default:
+			if inAttr {
+				valueSeen = false
+			}
+		}
 		sb.WriteString(string(v.Data))
 	}
 	return strings.TrimSpace(sb.String())
 }
 
-// compactSelectorString compacts a single selector by removing unnecessary whitespace.
-// Preserves spaces only between two identifier-like tokens (descendant combinator).
-// Removes spaces before/after [, ], (, ), >, +, ~, commas, and special tokens.
+// compactSelectorString compacts a single selector by collapsing each run of
+// whitespace to at most one space. A run is dropped only when one of the
+// characters it sits between already separates two selector components: a
+// combinator, a comma, an opening bracket on the left, a closing bracket on the
+// right, or an attribute-selector '='. Every other run is a descendant
+// combinator (or an attribute-selector modifier such as the 'i'/'s' flag) and
+// must survive. Quoted strings are copied verbatim.
 func compactSelectorString(s string) string {
 	var sb strings.Builder
 	i := 0
 	for i < len(s) {
 		ch := s[i]
-		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-			// Collapse whitespace
-			for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		if ch == '"' || ch == '\'' {
+			i = copyQuotedString(&sb, s, i)
+			continue
+		}
+		if isCSSSpace(ch) {
+			for i < len(s) && isCSSSpace(s[i]) {
 				i++
 			}
 			// Don't add leading or trailing space
 			if sb.Len() == 0 || i >= len(s) {
 				continue
 			}
-			// Check adjacent characters: skip space if next or prev is not an
-			// identifier character (letter, digit, -, _, *, %, /, .)
-			next := s[i]
 			buf := sb.String()
 			prev := buf[len(buf)-1]
-			if isSelectorIdentChar(prev) && isSelectorIdentChar(next) {
+			next := s[i]
+			if !separatesAfter(prev) && !separatesBefore(next) {
 				sb.WriteByte(' ')
 			}
 			continue
@@ -274,12 +338,127 @@ func compactSelectorString(s string) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// isSelectorIdentChar returns true if the character can be part of an identifier-like
-// token in a CSS selector. Spaces are only preserved between two such characters.
-func isSelectorIdentChar(ch byte) bool {
-	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-		(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '*' ||
-		ch == '%' || ch == ')' || ch == ']' || ch == '.'
+// copyQuotedString copies the quoted string starting at s[i] to sb verbatim and
+// returns the index just past its closing quote.
+func copyQuotedString(sb *strings.Builder, s string, i int) int {
+	quote := s[i]
+	sb.WriteByte(quote)
+	i++
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			sb.WriteString(s[i : i+2])
+			i += 2
+			continue
+		}
+		sb.WriteByte(s[i])
+		i++
+		if s[i-1] == quote {
+			break
+		}
+	}
+	return i
+}
+
+func isCSSSpace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f'
+}
+
+// separatesAfter reports whether whitespace following ch is redundant.
+func separatesAfter(ch byte) bool {
+	switch ch {
+	case '>', '+', '~', '/', ',', '(', '[', '=', '{', '}':
+		return true
+	}
+	return false
+}
+
+// separatesBefore reports whether whitespace preceding ch is redundant.
+func separatesBefore(ch byte) bool {
+	switch ch {
+	case '>', '+', '~', '/', ',', ')', ']', '=', '{':
+		return true
+	}
+	return false
+}
+
+// compactCustomProperty writes a compact custom property declaration. tdewolff
+// reports these through CustomPropertyGrammar with a single raw value token that
+// still carries its surrounding whitespace.
+func compactCustomProperty(w *strings.Builder, name string, values []css.Token) {
+	w.WriteString(strings.TrimSpace(name))
+	w.WriteString(":")
+	var raw strings.Builder
+	for _, v := range values {
+		raw.WriteString(string(v.Data))
+	}
+	w.WriteString(strings.TrimSpace(raw.String()))
+}
+
+// rawTokenState reassembles the raw token stream tdewolff emits for at-rules it
+// has no grammar for (@container, @scope, @starting-style) into compact CSS.
+// Whitespace runs collapse to a single space and are dropped where they can
+// never be significant. Brace depth tells selector context (depth 0) from
+// declaration context (depth above 0), which decides whether a colon or a
+// combinator character is a separator.
+type rawTokenState struct {
+	pendingWS bool
+	prev      byte
+	depth     int
+}
+
+func (r *rawTokenState) write(w *strings.Builder, tt css.TokenType, data []byte) {
+	if tt == css.CommentToken {
+		return
+	}
+	if tt == css.WhitespaceToken {
+		r.pendingWS = true
+		return
+	}
+	if len(data) == 0 {
+		return
+	}
+	if r.pendingWS {
+		r.pendingWS = false
+		if r.prev != 0 && !r.separatesAfter(r.prev) && !r.separatesBefore(data[0]) {
+			w.WriteByte(' ')
+		}
+	}
+	w.Write(data)
+	r.prev = data[len(data)-1]
+	for _, ch := range data {
+		switch ch {
+		case '{':
+			r.depth++
+		case '}':
+			r.depth--
+		}
+	}
+}
+
+// separatesAfter reports whether whitespace following ch is redundant.
+func (r *rawTokenState) separatesAfter(ch byte) bool {
+	switch ch {
+	case '{', '}', ';', ',', '(', '[', '=':
+		return true
+	case ':':
+		return r.depth > 0
+	case '>', '+', '~':
+		return r.depth == 0
+	}
+	return false
+}
+
+// separatesBefore reports whether whitespace preceding ch is redundant.
+func (r *rawTokenState) separatesBefore(ch byte) bool {
+	switch ch {
+	case '{', '}', ';', ',', ')', ']', '=', '!':
+		return true
+	case ':':
+		return r.depth > 0
+	case '>', '+', '~':
+		return r.depth == 0
+	}
+	return false
 }
 
 // compactDeclaration writes a compact CSS declaration.
@@ -397,7 +576,9 @@ func compactAtRulePrelude(values []css.Token) string {
 // normalizeURLToken removes quotes from url() tokens.
 // url('https://example.com') -> url(https://example.com)
 func normalizeURLToken(s string) string {
-	if !strings.HasPrefix(s, "url(") {
+	// tdewolff can emit an unterminated "url(" (len 4) at EOF; require a
+	// closing ')' so the slice below never goes out of range.
+	if !strings.HasPrefix(s, "url(") || !strings.HasSuffix(s, ")") || len(s) < 5 {
 		return s
 	}
 	inner := s[4 : len(s)-1] // extract content between url( and )

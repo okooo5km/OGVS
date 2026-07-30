@@ -76,13 +76,13 @@ func ComputeOwnStyle(stylesheet *Stylesheet, node *svgast.Element) ComputedStyle
 
 	// Collect matching CSS rules
 	for _, rule := range stylesheet.Rules {
-		if Matches(node, rule.Selector, stylesheet.Parents) {
+		if Matches(node, rule.StyleSelector, stylesheet.Parents) {
 			for _, decl := range rule.Declarations {
 				computed := computedStyle[decl.Name]
 				if computed != nil && computed.Type == StyleDynamic {
 					continue
 				}
-				if rule.Dynamic {
+				if rule.StyleDynamic {
 					computedStyle[decl.Name] = &ComputedStyle{
 						Type: StyleDynamic, Inherited: false,
 					}

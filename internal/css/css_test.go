@@ -408,3 +408,339 @@ func TestContainsPseudoClass(t *testing.T) {
 		}
 	}
 }
+
+func TestParseNth(t *testing.T) {
+	tests := []struct {
+		in   string
+		a, b int
+		ok   bool
+	}{
+		{"odd", 2, 1, true},
+		{"even", 2, 0, true},
+		{"EVEN", 2, 0, true},
+		{"2n+1", 2, 1, true},
+		{"-n+3", -1, 3, true},
+		{"3", 0, 3, true},
+		{"+3", 0, 3, true},
+		{"-1", 0, -1, true},
+		{"n", 1, 0, true},
+		{"2n", 2, 0, true},
+		{" -2n + 3 ", -2, 3, true},
+		{"+3n-2", 3, -2, true},
+		{"0", 0, 0, true},
+		{"bogus", 0, 0, false},
+		{"", 0, 0, false},
+		{"2n+", 0, 0, false},
+		{"n+2x", 0, 0, false},
+	}
+
+	for _, tt := range tests {
+		got, ok := parseNth(tt.in)
+		if ok != tt.ok || (ok && (got.a != tt.a || got.b != tt.b)) {
+			t.Errorf("parseNth(%q) = {%d,%d},%v, want {%d,%d},%v",
+				tt.in, got.a, got.b, ok, tt.a, tt.b, tt.ok)
+		}
+	}
+}
+
+func TestNthExprMatches(t *testing.T) {
+	// Positions selected out of the 1-based index range 1..4.
+	tests := []struct {
+		formula string
+		want    []int
+	}{
+		{"n", []int{1, 2, 3, 4}},
+		{"-n+2", []int{1, 2}},
+		{"2n+1", []int{1, 3}},
+		{"0", nil},
+		{"-1", nil},
+		{"1", []int{1}},
+		{"+3", []int{3}},
+		{"even", []int{2, 4}},
+		{"odd", []int{1, 3}},
+	}
+
+	for _, tt := range tests {
+		expr, ok := parseNth(tt.formula)
+		if !ok {
+			t.Errorf("parseNth(%q) failed", tt.formula)
+			continue
+		}
+		var got []int
+		for i := 1; i <= 4; i++ {
+			// matchesNone/matchesAll are the css-select shortcuts; both
+			// degenerate correctly for a parent that is an element.
+			if expr.matchesNone() {
+				break
+			}
+			if expr.matchesAll() || expr.matches(i) {
+				got = append(got, i)
+			}
+		}
+		if len(got) != len(tt.want) {
+			t.Errorf("%q selected %v, want %v", tt.formula, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("%q selected %v, want %v", tt.formula, got, tt.want)
+				break
+			}
+		}
+	}
+}
+
+func TestParseAttrSelector(t *testing.T) {
+	tests := []struct {
+		in    string
+		name  string
+		op    string
+		value string
+		ic    bool
+		bad   bool
+	}{
+		{"[fill]", "fill", "", "", false, false},
+		{"[fill=red]", "fill", "=", "red", false, false},
+		{`[fill='#00ff00']`, "fill", "=", "#00ff00", false, false},
+		{`[size=""]`, "size", "=", "", false, false},
+		{"[class~=foo]", "class", "~=", "foo", false, false},
+		{"[lang|=en]", "lang", "|=", "en", false, false},
+		{"[a^=b]", "a", "^=", "b", false, false},
+		{"[a$=b]", "a", "$=", "b", false, false},
+		{"[a*=b]", "a", "*=", "b", false, false},
+		{"[a!=b]", "a", "!=", "b", false, false},
+		{"[a=b i]", "a", "=", "b", true, false},
+		{"[a=b s]", "a", "=", "b", false, false},
+		{`[a=a\]b]`, "a", "=", "a]b", false, false},
+		{"[|a=b]", "a", "=", "b", false, false},
+		{"[ns|a]", "a", "", "", false, true},
+		{"[a=b c]", "a", "=", "b", false, true},
+	}
+
+	for _, tt := range tests {
+		i := 1 // skip '['
+		as := parseAttrSelector(tt.in, &i)
+		if as.name != tt.name || as.op != tt.op || as.value != tt.value ||
+			as.ignoreCase != tt.ic || as.invalid != tt.bad {
+			t.Errorf("parseAttrSelector(%q) = %+v", tt.in, as)
+		}
+		if i != len(tt.in) {
+			t.Errorf("parseAttrSelector(%q) consumed %d of %d bytes", tt.in, i, len(tt.in))
+		}
+	}
+}
+
+func TestMatches_AttrOperators(t *testing.T) {
+	parents := make(map[svgast.Node]svgast.Parent)
+	elem := &svgast.Element{Name: "rect", Attributes: svgast.NewOrderedAttrs()}
+	elem.Attributes.Set("class", "foo bar")
+	elem.Attributes.Set("lang", "en-US")
+	elem.Attributes.Set("fill", "RED")
+	elem.Attributes.Set("empty", "")
+
+	tests := []struct {
+		selector string
+		want     bool
+	}{
+		{"[class~=foo]", true},
+		{"[class~=bar]", true},
+		{"[class~=fo]", false},
+		{`[class~="foo bar"]`, false}, // whitespace in value never matches
+		{`[empty~=""]`, true},         // css-select quirk: empty value matches empty attr
+		{`[class~=""]`, false},
+		{"[lang|=en]", true},
+		{"[lang|=en-US]", true},
+		{"[lang|=e]", false},
+		{`[empty|=""]`, true},
+		{"[class^=foo]", true},
+		{"[class^=oo]", false},
+		{`[class^=""]`, false}, // empty prefix never matches
+		{"[class$=bar]", true},
+		{`[class$=""]`, false},
+		{"[class*=o b]", false},
+		{"[class*=oo]", true},
+		{`[class*=""]`, false},
+		{"[fill=RED]", true},
+		{"[fill=red]", false},
+		{"[fill=red i]", true},
+		{"[fill=red s]", false},
+		{"[fill=RED I]", true},
+		{"[class!=foo]", true},
+		{`[class!="foo bar"]`, false},
+		{"[missing!=x]", true},
+		{`[empty!=""]`, false},
+		{"[ class ~= foo ]", true},
+		{"[missing~=foo]", false},
+		{"[missing|=foo]", false},
+		{"[xlink|href]", false}, // namespaced: css-select rejects
+	}
+
+	for _, tt := range tests {
+		if got := Matches(elem, tt.selector, parents); got != tt.want {
+			t.Errorf("Matches(%q) = %v, want %v", tt.selector, got, tt.want)
+		}
+	}
+}
+
+// structuralFixture builds <svg><g id="g1"><!--c--><rect id="a"/>text<circle
+// id="b"/><rect id="c"/></g><g id="g2"/></svg> and returns the parent map plus
+// a lookup from id to element.
+func structuralFixture() (map[svgast.Node]svgast.Parent, map[string]*svgast.Element) {
+	newElem := func(name, id string) *svgast.Element {
+		e := &svgast.Element{Name: name, Attributes: svgast.NewOrderedAttrs()}
+		if id != "" {
+			e.Attributes.Set("id", id)
+		}
+		return e
+	}
+
+	rectA := newElem("rect", "a")
+	circleB := newElem("circle", "b")
+	rectC := newElem("rect", "c")
+	g1 := newElem("g", "g1")
+	g1.Children = []svgast.Node{
+		&svgast.Comment{Value: "c"},
+		rectA,
+		&svgast.Text{Value: "text"},
+		circleB,
+		rectC,
+	}
+	g2 := newElem("g", "g2")
+	svg := newElem("svg", "")
+	svg.Children = []svgast.Node{g1, g2}
+	root := &svgast.Root{Children: []svgast.Node{svg}}
+
+	parents := map[svgast.Node]svgast.Parent{
+		svg: root, g1: svg, g2: svg,
+		rectA: g1, circleB: g1, rectC: g1,
+	}
+	for _, c := range g1.Children {
+		parents[c] = g1
+	}
+
+	return parents, map[string]*svgast.Element{
+		"svg": svg, "g1": g1, "g2": g2,
+		"a": rectA, "b": circleB, "c": rectC,
+	}
+}
+
+func TestMatches_StructuralPseudoClasses(t *testing.T) {
+	parents, byID := structuralFixture()
+
+	tests := []struct {
+		selector string
+		want     []string // ids of the elements that must match
+	}{
+		{"rect:first-child", []string{"a"}}, // the leading comment does not count
+		{"rect:last-child", []string{"c"}},
+		{"rect:first-of-type", []string{"a"}},
+		{"rect:last-of-type", []string{"c"}},
+		{"circle:only-of-type", []string{"b"}},
+		{"rect:only-of-type", nil},
+		{"g:only-child", nil},
+		{"rect:nth-child(1)", []string{"a"}},
+		{"rect:nth-child(3)", []string{"c"}},
+		{"rect:nth-child(odd)", []string{"a", "c"}},
+		{"rect:nth-child(-n+2)", []string{"a"}},
+		{"rect:nth-of-type(2)", []string{"c"}},
+		{"rect:nth-last-of-type(1)", []string{"c"}},
+		{"rect:nth-last-child(1)", []string{"c"}},
+		{"rect:nth-child(0)", nil},
+		{":root", []string{"svg"}},
+		{"g:empty", []string{"g2"}},
+		{":is(circle, g)", []string{"g1", "g2", "b"}},
+		{":where(rect)", []string{"a", "c"}},
+		{"g:has(circle)", []string{"g1"}},
+		{"g:has(> rect)", []string{"g1"}},
+		{"rect:not([id=a])", []string{"c"}},
+	}
+
+	ids := []string{"svg", "g1", "g2", "a", "b", "c"}
+	for _, tt := range tests {
+		want := make(map[string]bool, len(tt.want))
+		for _, id := range tt.want {
+			want[id] = true
+		}
+		for _, id := range ids {
+			got := Matches(byID[id], tt.selector, parents)
+			if got != want[id] {
+				t.Errorf("Matches(%s, %q) = %v, want %v", id, tt.selector, got, want[id])
+			}
+		}
+	}
+}
+
+func TestCalculateSpecificity_PseudoClasses(t *testing.T) {
+	tests := []struct {
+		selector string
+		want     Specificity
+	}{
+		{"rect:first-child", Specificity{0, 0, 1, 1}},
+		{"path:not([fill=blue])", Specificity{0, 0, 1, 1}},
+		{":not(.a)", Specificity{0, 0, 1, 0}},
+		{":not(#x)", Specificity{0, 1, 0, 0}},
+		{":not(.a, #b)", Specificity{0, 1, 0, 0}}, // max of the list, not the sum
+		{":not(.a.b)", Specificity{0, 0, 2, 0}},
+		{":is(.a, #b)", Specificity{0, 1, 0, 0}},
+		{":where(#a.b)", Specificity{0, 0, 0, 0}},
+		{":where(.a):where(.b)", Specificity{0, 0, 0, 0}},
+		{":has(.x)", Specificity{0, 0, 1, 0}},
+		{":has(> .x)", Specificity{0, 0, 1, 0}},
+		{":has(a b)", Specificity{0, 0, 0, 2}},
+		{":hover", Specificity{0, 0, 1, 0}},
+		{"rect::before", Specificity{0, 0, 0, 2}},
+		{"rect:nth-child(2n+1)", Specificity{0, 0, 1, 1}},
+		{"a:not(.b):not(.c)", Specificity{0, 0, 2, 1}},
+		{"a.b#c[d]:hover::before", Specificity{0, 1, 3, 2}},
+		{":not(:not(.a))", Specificity{0, 0, 1, 0}},
+		{"g:not(.a) rect:first-of-type", Specificity{0, 0, 2, 2}},
+		{"svg .hidden:target", Specificity{0, 0, 2, 1}},
+	}
+
+	for _, tt := range tests {
+		if got := CalculateSpecificity(tt.selector); got != tt.want {
+			t.Errorf("CalculateSpecificity(%q) = %v, want %v", tt.selector, got, tt.want)
+		}
+	}
+}
+
+func TestStripAllPseudoClasses(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"rect:first-child", "rect"},
+		{"path:not([fill=blue])", "path"},
+		{"svg .hidden:target", "svg .hidden"},
+		{".st0:hover", ".st0"},
+		{"rect:nth-child(2n+1)", "rect"},
+		{"rect::before", "rect::before"},
+		{":root", ""},
+	}
+
+	for _, tt := range tests {
+		if got := StripAllPseudoClasses(tt.input); got != tt.want {
+			t.Errorf("StripAllPseudoClasses(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestContainsAnyPseudoClass(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"rect:first-child", true},
+		{"path:not([fill=blue])", true},
+		{"svg .hidden:target", true},
+		{"rect::before", false},
+		{".cls", false},
+		{`[href="a:b"]`, false}, // a colon inside an attribute value is not a pseudo
+	}
+
+	for _, tt := range tests {
+		if got := ContainsAnyPseudoClass(tt.input); got != tt.want {
+			t.Errorf("ContainsAnyPseudoClass(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}

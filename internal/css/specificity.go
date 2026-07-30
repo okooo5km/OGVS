@@ -21,167 +21,102 @@ func CompareSpecificity(a, b Specificity) int {
 }
 
 // CalculateSpecificity calculates the CSS specificity of a selector string.
-// Returns [inline, ids, classes, elements].
-// This is a simplified implementation for SVG selectors.
+// Returns [inline, ids, classes, elements]; index 0 is always 0 for stylesheet
+// rules. Mirrors csso's syntax.specificity().
 func CalculateSpecificity(selector string) Specificity {
 	var spec Specificity
-	// spec[0] = inline style (always 0 for stylesheet rules)
-
-	// Remove content inside brackets to avoid false matches
-	clean := removeBracketContent(selector)
-
-	// Count IDs (#)
-	spec[1] = strings.Count(clean, "#")
-
-	// Count classes (.), attribute selectors ([), and pseudo-classes (:)
-	spec[2] = strings.Count(clean, ".")
-	spec[2] += countBracketSelectors(selector)
-	spec[2] += countPseudoClasses(clean)
-
-	// Count element selectors and pseudo-elements (::)
-	spec[3] = countElementSelectors(clean)
-	spec[3] += countPseudoElements(clean)
-
+	accumulateSpecificity(selector, &spec)
 	return spec
 }
 
-// removeBracketContent removes content inside [] brackets.
-func removeBracketContent(s string) string {
-	var result strings.Builder
-	depth := 0
-	for _, ch := range s {
-		if ch == '[' {
-			depth++
-			continue
-		}
-		if ch == ']' {
-			depth--
-			continue
-		}
-		if depth == 0 {
-			result.WriteRune(ch)
-		}
-	}
-	return result.String()
-}
-
-// countBracketSelectors counts the number of attribute selectors [attr].
-func countBracketSelectors(s string) int {
-	count := 0
-	for _, ch := range s {
-		if ch == '[' {
-			count++
-		}
-	}
-	return count
-}
-
-// countPseudoClasses counts single-colon pseudo-classes (not pseudo-elements).
-func countPseudoClasses(s string) int {
-	count := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ':' {
-			// Check it's not a pseudo-element (::)
-			if i+1 < len(s) && s[i+1] == ':' {
-				i++ // skip the second colon
-				continue
-			}
-			count++
-		}
-	}
-	return count
-}
-
-// countPseudoElements counts :: pseudo-elements.
-func countPseudoElements(s string) int {
-	return strings.Count(s, "::")
-}
-
-// countElementSelectors counts element type selectors.
-func countElementSelectors(s string) int {
-	// Remove IDs, classes, pseudo-classes, pseudo-elements from selector
-	// Then count remaining identifiers
-	count := 0
-
-	// Split by combinators and count element names
-	parts := splitByCombinators(s)
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" || part == "*" {
-			continue
-		}
-
-		// Remove IDs (#id), classes (.class), pseudo-classes (:hover), pseudo-elements (::before)
-		clean := removeIDClassPseudo(part)
-		clean = strings.TrimSpace(clean)
-
-		if clean != "" && clean != "*" {
-			count++
-		}
-	}
-
-	return count
-}
-
-// splitByCombinators splits selector by combinator characters.
-func splitByCombinators(s string) []string {
-	var parts []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '>' || s[i] == '+' || s[i] == '~' {
-			if start < i {
-				parts = append(parts, s[start:i])
-			}
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		parts = append(parts, s[start:])
-	}
-	return parts
-}
-
-// removeIDClassPseudo removes #id, .class, :pseudo from a simple selector.
-func removeIDClassPseudo(s string) string {
-	var result strings.Builder
+// accumulateSpecificity walks a selector and adds its contribution to spec.
+func accumulateSpecificity(s string, spec *Specificity) {
 	i := 0
 	for i < len(s) {
-		if s[i] == '#' || s[i] == '.' || s[i] == ':' {
-			// Skip until next # . : or end
+		switch s[i] {
+		case '#':
 			i++
-			for i < len(s) && s[i] != '#' && s[i] != '.' && s[i] != ':' &&
-				s[i] != ' ' && s[i] != '>' && s[i] != '+' && s[i] != '~' {
+			readIdent(s, &i)
+			spec[1]++
+
+		case '.':
+			i++
+			readIdent(s, &i)
+			spec[2]++
+
+		case '[':
+			i++
+			parseAttrSelector(s, &i)
+			spec[2]++
+
+		case ':':
+			i++
+			if i < len(s) && s[i] == ':' {
+				// Pseudo-element: counts as an element.
 				i++
+				readIdent(s, &i)
+				if i < len(s) && s[i] == '(' {
+					readParenGroup(s, &i)
+				}
+				spec[3]++
+				continue
 			}
-		} else {
-			result.WriteByte(s[i])
+			name := strings.ToLower(readIdent(s, &i))
+			var arg string
+			if i < len(s) && s[i] == '(' {
+				arg = readParenGroup(s, &i)
+			}
+			switch name {
+			case "where":
+				// :where() always contributes zero specificity.
+			case "is", "matches", "not", "has":
+				// Contribute the specificity of the most specific argument.
+				var best Specificity
+				for _, part := range splitSelectors(arg) {
+					var cur Specificity
+					accumulateSpecificity(part, &cur)
+					if CompareSpecificity(cur, best) > 0 {
+						best = cur
+					}
+				}
+				spec[1] += best[1]
+				spec[2] += best[2]
+				spec[3] += best[3]
+			default:
+				// Every other pseudo-class counts as a class.
+				spec[2]++
+			}
+
+		case '*', ' ', '\t', '\n', '\r', '\f', '>', '+', '~', ',':
 			i++
+
+		default:
+			before := i
+			readIdent(s, &i)
+			if i == before {
+				i++
+				continue
+			}
+			spec[3]++
 		}
 	}
-	return result.String()
 }
 
-// evaluatablePseudoClasses are pseudo-classes that can be evaluated at optimization
-// time (they don't depend on runtime state like :hover or :focus).
-var evaluatablePseudoClasses = map[string]bool{
-	"not":              true,
-	"is":               true,
-	"where":            true,
-	"has":              true,
-	"matches":          true,
-	"nth-child":        true,
-	"nth-last-child":   true,
-	"nth-of-type":      true,
-	"nth-last-of-type": true,
-	"first-child":      true,
-	"last-child":       true,
-	"first-of-type":    true,
-	"last-of-type":     true,
-	"only-child":       true,
-	"only-of-type":     true,
-	"empty":            true,
-	"root":             true,
-}
+// evaluatablePseudoClasses are the pseudo-classes SVGO's inlineStyles keeps in
+// the selector and lets css-select evaluate. It is exactly
+// pseudoClasses.functional + pseudoClasses.treeStructural (SVGO's
+// `preservedPseudos` in plugins/inlineStyles.js), plus :matches, the historical
+// alias of :is that css-select also understands.
+var evaluatablePseudoClasses = func() map[string]bool {
+	m := map[string]bool{"matches": true}
+	for k := range treeStructuralPseudoClasses {
+		m[k] = true
+	}
+	for k := range functionalPseudoClasses {
+		m[k] = true
+	}
+	return m
+}()
 
 // containsPseudoClass checks if a selector contains any non-evaluatable pseudo-class
 // (single colon, not ::, not evaluatable like :not/:is/:where/:has).
@@ -197,7 +132,8 @@ func containsPseudoClass(s string) bool {
 			nameEnd := nameStart
 			for nameEnd < len(s) && s[nameEnd] != '(' && s[nameEnd] != ' ' &&
 				s[nameEnd] != ':' && s[nameEnd] != '.' && s[nameEnd] != '#' &&
-				s[nameEnd] != '[' && s[nameEnd] != ')' && s[nameEnd] != ',' {
+				s[nameEnd] != '[' && s[nameEnd] != ')' && s[nameEnd] != ',' &&
+				s[nameEnd] != '>' && s[nameEnd] != '+' && s[nameEnd] != '~' {
 				nameEnd++
 			}
 			name := s[nameStart:nameEnd]
@@ -316,4 +252,75 @@ func StripPseudoClasses(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// ContainsAnyPseudoClass reports whether a selector contains any pseudo-class,
+// mirroring `hasPseudoClasses` in SVGO's lib/style.js parseRule.
+// Pseudo-elements (::) do not count.
+func ContainsAnyPseudoClass(s string) bool {
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case '[':
+			i++
+			parseAttrSelector(s, &i)
+		case ':':
+			i++
+			if i < len(s) && s[i] == ':' {
+				i++
+				readIdent(s, &i)
+				continue
+			}
+			return true
+		default:
+			before := i
+			readIdent(s, &i)
+			if i == before {
+				i++
+			}
+		}
+	}
+	return false
+}
+
+// StripAllPseudoClasses removes every pseudo-class, including its functional
+// argument, from a selector. This mirrors SVGO's lib/style.js parseRule, which
+// walks the selector and removes every PseudoClassSelector node before using
+// the result for matching. Pseudo-elements (::) are preserved, as SVGO
+// preserves them too.
+func StripAllPseudoClasses(s string) string {
+	var out strings.Builder
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case '[':
+			start := i
+			i++
+			parseAttrSelector(s, &i)
+			out.WriteString(s[start:i])
+		case ':':
+			if i+1 < len(s) && s[i+1] == ':' {
+				start := i
+				i += 2
+				readIdent(s, &i)
+				out.WriteString(s[start:i])
+				continue
+			}
+			i++
+			readIdent(s, &i)
+			if i < len(s) && s[i] == '(' {
+				readParenGroup(s, &i)
+			}
+		default:
+			before := i
+			readIdent(s, &i)
+			if i == before {
+				out.WriteByte(s[i])
+				i++
+				continue
+			}
+			out.WriteString(s[before:i])
+		}
+	}
+	return strings.TrimSpace(out.String())
 }

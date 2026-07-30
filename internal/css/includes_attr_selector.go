@@ -20,32 +20,32 @@ import "strings"
 // with traversed=false and value=null by default.
 func IncludesAttrSelector(rules []StylesheetRule, name string, value *string) bool {
 	for _, rule := range rules {
-		if selectorIncludesAttr(rule.Selector, name, value) {
+		if selectorIncludesAttr(rule.Selector, name, value, false) {
 			return true
 		}
 	}
 	return false
 }
 
-// selectorIncludesAttr checks if a single selector string contains an
-// attribute selector that matches the given name and optional value.
+// SelectorIncludesAttr reports whether a single selector string references the
+// given attribute name, optionally with a specific value.
 //
-// This parses the selector and looks for:
-//   - [name] - attribute presence
-//   - [name=value] - attribute value match
-//   - [name~=value], [name|=value], etc. - other attribute selectors
-//
-// The traversed parameter from SVGO is not needed here since
-// removeUnknownsAndDefaults always calls with traversed=false.
-func selectorIncludesAttr(selector string, name string, value *string) bool {
-	// Split comma-separated selectors
-	selectors := splitSelectors(selector)
-	for _, sel := range selectors {
+// When traversed is true only references that are followed by a combinator
+// count, mirroring the csswhat.isTraversal check SVGO performs on the segment
+// after the matched one.
+func SelectorIncludesAttr(selector string, name string, value *string, traversed bool) bool {
+	return selectorIncludesAttr(selector, name, value, traversed)
+}
+
+// selectorIncludesAttr checks if a selector string contains an attribute
+// selector that matches the given name and optional value.
+func selectorIncludesAttr(selector string, name string, value *string, traversed bool) bool {
+	for _, sel := range splitSelectors(selector) {
 		sel = strings.TrimSpace(sel)
 		if sel == "" {
 			continue
 		}
-		if subselectorIncludesAttr(sel, name, value) {
+		if subselectorIncludesAttr(sel, name, value, traversed) {
 			return true
 		}
 	}
@@ -54,66 +54,102 @@ func selectorIncludesAttr(selector string, name string, value *string) bool {
 
 // subselectorIncludesAttr checks a single (non-comma-separated) selector
 // for attribute selectors matching the given name.
-func subselectorIncludesAttr(sel string, name string, value *string) bool {
-	i := 0
-	for i < len(sel) {
-		ch := sel[i]
-
-		switch ch {
-		case '[':
-			// Parse attribute selector
-			i++ // skip [
-			attrName, attrVal, hasVal := parseAttrSelector(sel, &i)
-			if attrName == name {
-				if value == nil {
-					return true
-				}
-				if hasVal && attrVal == *value {
-					return true
-				}
-			}
-
-		case '\'', '"':
-			// Skip quoted strings
-			quote := ch
-			i++
-			for i < len(sel) && sel[i] != quote {
-				if sel[i] == '\\' && i+1 < len(sel) {
-					i++ // skip escaped char
-				}
-				i++
-			}
-			if i < len(sel) {
-				i++ // skip closing quote
-			}
-
-		case '(':
-			// Skip parenthesized content (but still recurse into it for :not() etc.)
-			depth := 1
-			i++
-			start := i
-			for i < len(sel) && depth > 0 {
-				if sel[i] == '(' {
-					depth++
-				} else if sel[i] == ')' {
-					depth--
-				}
-				if depth > 0 {
-					i++
-				}
-			}
-			// Check inner content for attribute selectors too
-			inner := sel[start:i]
-			if subselectorIncludesAttr(inner, name, value) {
-				return true
-			}
-			if i < len(sel) {
-				i++ // skip closing )
-			}
-
-		default:
-			i++
+func subselectorIncludesAttr(sel string, name string, value *string, traversed bool) bool {
+	for _, ref := range selectorAttrRefs(sel) {
+		if traversed && !ref.followedByTraversal {
+			continue
+		}
+		if ref.name != name {
+			continue
+		}
+		if value == nil {
+			return true
+		}
+		if ref.hasValue && ref.value == *value {
+			return true
 		}
 	}
 	return false
+}
+
+// selectorAttrRef is an attribute reference made by one segment of a selector,
+// in the shape css-what reports it: class and ID selectors are attribute
+// selectors on `class` and `id`.
+type selectorAttrRef struct {
+	name  string
+	value string
+	// hasValue is false for a bare presence test, which never matches a value.
+	hasValue bool
+	// followedByTraversal reports whether the next segment is a combinator.
+	followedByTraversal bool
+}
+
+// selectorAttrRefs collects the attribute references of a single complex
+// selector, in source order.
+func selectorAttrRefs(sel string) []selectorAttrRef {
+	parts, _ := parseSelectorParts(sel)
+
+	var refs []selectorAttrRef
+	for pi, part := range parts {
+		conditions := parseSimpleSelector(part)
+		for ci, cond := range conditions {
+			ref, ok := attrRefFromCondition(cond)
+			if !ok {
+				continue
+			}
+			// A combinator follows only the last simple selector of a
+			// compound, and only when another compound comes after it.
+			ref.followedByTraversal = pi < len(parts)-1 && ci == len(conditions)-1
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
+// attrRefFromCondition maps a parsed selector condition onto the attribute
+// reference css-what would report for it.
+func attrRefFromCondition(cond selectorCondition) (selectorAttrRef, bool) {
+	switch cond.condType {
+	case "class":
+		return selectorAttrRef{name: "class", value: cond.name, hasValue: true}, true
+	case "id":
+		return selectorAttrRef{name: "id", value: cond.name, hasValue: true}, true
+	case "attr":
+		return selectorAttrRef{name: cond.name}, true
+	case "attr-eq":
+		return selectorAttrRef{name: cond.name, value: cond.value, hasValue: true}, true
+	}
+	return selectorAttrRef{}, false
+}
+
+// SelectorClassNames returns the names of the class selectors that appear
+// directly in a selector, in source order. It mirrors the ClassSelector
+// children csstree reports for a Selector node, so names nested inside
+// functional pseudo-classes such as :not() are excluded.
+func SelectorClassNames(selector string) []string {
+	parts, _ := parseSelectorParts(selector)
+
+	var names []string
+	for _, part := range parts {
+		for _, cond := range parseSimpleSelector(part) {
+			if cond.condType == "class" {
+				names = append(names, cond.name)
+			}
+		}
+	}
+	return names
+}
+
+// SelectorLeadingID returns the name of a selector's first sub-selector when
+// that sub-selector is an ID selector.
+func SelectorLeadingID(selector string) (string, bool) {
+	parts, _ := parseSelectorParts(selector)
+	if len(parts) == 0 {
+		return "", false
+	}
+	conditions := parseSimpleSelector(parts[0])
+	if len(conditions) == 0 || conditions[0].condType != "id" {
+		return "", false
+	}
+	return conditions[0].name, true
 }

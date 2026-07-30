@@ -21,8 +21,14 @@ type StylesheetDeclaration struct {
 
 // StylesheetRule represents a CSS rule with its selector, specificity, and declarations.
 type StylesheetRule struct {
+	// Dynamic and Selector implement SVGO's inlineStyles policy: the
+	// pseudo-classes css-select can evaluate stay in the selector.
+	// StyleDynamic and StyleSelector implement lib/style.js's policy: every
+	// pseudo-class is stripped and the rule becomes dynamic instead.
 	Dynamic          bool
+	StyleDynamic     bool
 	Selector         string // cleaned selector (pseudo-classes stripped for matching)
+	StyleSelector    string // selector with every pseudo-class stripped
 	OriginalSelector string // original selector (with pseudo-classes, for CSS output)
 	Specificity      Specificity
 	Declarations     []StylesheetDeclaration

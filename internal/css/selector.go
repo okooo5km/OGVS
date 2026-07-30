@@ -5,28 +5,37 @@ package css
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/okooo5km/ogvs/internal/svgast"
 )
 
+// matchCtx carries matcher state across a single selector evaluation.
+// err is set when css-select would have thrown, which makes the whole selector
+// unusable; callers that care use the *Err variants.
+type matchCtx struct {
+	parents map[svgast.Node]svgast.Parent
+	err     bool
+}
+
 // Matches checks if an element matches a CSS selector string.
 // parents provides the parent map for traversal.
 func Matches(node *svgast.Element, selector string, parents map[svgast.Node]svgast.Parent) bool {
-	selectors := splitSelectors(selector)
-	for _, sel := range selectors {
-		sel = strings.TrimSpace(sel)
-		if sel == "" {
-			continue
-		}
-		if matchesCompound(node, sel, parents) {
-			return true
-		}
-	}
-	return false
+	matched, _ := MatchesErr(node, selector, parents)
+	return matched
 }
 
-// matchesCompound matches a single compound selector (no commas).
-func matchesCompound(node *svgast.Element, selector string, parents map[svgast.Node]svgast.Parent) bool {
+// MatchesErr is Matches, additionally reporting whether the selector could be
+// fully evaluated. When ok is false the selector contains something css-select
+// throws on, and SVGO skips the rule entirely.
+func MatchesErr(node *svgast.Element, selector string, parents map[svgast.Node]svgast.Parent) (matched, ok bool) {
+	ctx := &matchCtx{parents: parents}
+	matched = matchesSelectorList(node, selector, ctx)
+	return matched, !ctx.err
+}
+
+// matchesCompound matches a single complex selector (no commas).
+func matchesCompound(node *svgast.Element, selector string, ctx *matchCtx) bool {
 	// Parse the selector into parts split by combinators
 	parts, combinators := parseSelectorParts(selector)
 	if len(parts) == 0 {
@@ -34,7 +43,7 @@ func matchesCompound(node *svgast.Element, selector string, parents map[svgast.N
 	}
 
 	// Match from right to left
-	if !matchesSimple(node, parts[len(parts)-1]) {
+	if !matchesSimple(node, parts[len(parts)-1], ctx) {
 		return false
 	}
 
@@ -51,49 +60,49 @@ func matchesCompound(node *svgast.Element, selector string, parents map[svgast.N
 		switch combinator {
 		case ' ': // descendant
 			found := false
-			parent := parents[currentNode]
+			parent := ctx.parents[currentNode]
 			for parent != nil {
 				if elem, ok := parent.(*svgast.Element); ok {
-					if matchesSimple(elem, part) {
+					if matchesSimple(elem, part, ctx) {
 						currentNode = elem
 						found = true
 						break
 					}
 				}
-				parent = parents[parent]
+				parent = ctx.parents[parent]
 			}
 			if !found {
 				return false
 			}
 
 		case '>': // child
-			parent := parents[currentNode]
+			parent := ctx.parents[currentNode]
 			if parent == nil {
 				return false
 			}
 			elem, ok := parent.(*svgast.Element)
-			if !ok || !matchesSimple(elem, part) {
+			if !ok || !matchesSimple(elem, part, ctx) {
 				return false
 			}
 			currentNode = elem
 
 		case '+': // adjacent sibling
-			sibling := getPreviousSibling(currentNode, parents)
-			if sibling == nil || !matchesSimple(sibling, part) {
+			sibling := getPreviousSibling(currentNode, ctx.parents)
+			if sibling == nil || !matchesSimple(sibling, part, ctx) {
 				return false
 			}
 			currentNode = sibling
 
 		case '~': // general sibling
 			found := false
-			sibling := getPreviousSibling(currentNode, parents)
+			sibling := getPreviousSibling(currentNode, ctx.parents)
 			for sibling != nil {
-				if matchesSimple(sibling, part) {
+				if matchesSimple(sibling, part, ctx) {
 					currentNode = sibling
 					found = true
 					break
 				}
-				sibling = getPreviousSibling(sibling, parents)
+				sibling = getPreviousSibling(sibling, ctx.parents)
 			}
 			if !found {
 				return false
@@ -226,7 +235,7 @@ func parseSelectorParts(selector string) (parts []string, combinators []byte) {
 
 // matchesSimple matches an element against a simple selector (no combinators).
 // Supports: element, .class, #id, [attr], [attr=val], *
-func matchesSimple(elem *svgast.Element, selector string) bool {
+func matchesSimple(elem *svgast.Element, selector string, ctx *matchCtx) bool {
 	if selector == "*" {
 		return true
 	}
@@ -234,7 +243,7 @@ func matchesSimple(elem *svgast.Element, selector string) bool {
 	// Parse simple selector into conditions
 	conditions := parseSimpleSelector(selector)
 	for _, cond := range conditions {
-		if !matchCondition(elem, cond) {
+		if !matchCondition(elem, cond, ctx) {
 			return false
 		}
 	}
@@ -243,10 +252,15 @@ func matchesSimple(elem *svgast.Element, selector string) bool {
 }
 
 type selectorCondition struct {
-	condType string // "element", "class", "id", "attr", "attr-eq", "not"
-	name     string
-	value    string
-	inner    []selectorCondition // for "not" type
+	condType   string // "element", "class", "id", "attr", "attr-eq", "pseudo"
+	name       string
+	value      string
+	op         string // attribute operator: "=", "~=", "|=", "^=", "$=", "*=", "!="
+	ignoreCase bool   // the `i` flag on an attribute selector
+	invalid    bool   // css-select rejects this selector outright
+	arg        string // functional pseudo-class argument, e.g. "2n+1" or ".a, .b"
+	nth        nthExpr
+	nthOK      bool // false when the An+B argument failed to parse
 }
 
 // parseSimpleSelector parses a simple selector into conditions.
@@ -272,81 +286,55 @@ func parseSimpleSelector(selector string) []selectorCondition {
 
 		case '[': // Attribute selector
 			i++ // skip [
-			attr, val, hasVal := parseAttrSelector(selector, &i)
-			if hasVal {
-				conditions = append(conditions, selectorCondition{
-					condType: "attr-eq", name: attr, value: val,
-				})
-			} else {
-				conditions = append(conditions, selectorCondition{
-					condType: "attr", name: attr,
-				})
+			as := parseAttrSelector(selector, &i)
+			cond := selectorCondition{
+				condType:   "attr",
+				name:       as.name,
+				value:      as.value,
+				op:         as.op,
+				ignoreCase: as.ignoreCase,
+				invalid:    as.invalid,
 			}
+			if as.op != "" {
+				cond.condType = "attr-eq"
+			}
+			conditions = append(conditions, cond)
 
 		case ':': // Pseudo-class/element
 			i++
 			if i < len(selector) && selector[i] == ':' {
-				i++ // pseudo-element — skip
+				// Pseudo-element: css-select rejects these outright and SVGO
+				// never strips them, so keep ignoring them.
+				i++
 				readIdent(selector, &i)
 				continue
 			}
-			// Read pseudo-class name
-			nameStart := i
-			name := readIdent(selector, &i)
-
-			if name == "not" && i < len(selector) && selector[i] == '(' {
-				// :not() — parse inner selector as negation
-				i++ // skip (
-				innerStart := i
-				depth := 1
-				for i < len(selector) && depth > 0 {
-					if selector[i] == '(' {
-						depth++
-					}
-					if selector[i] == ')' {
-						depth--
-					}
-					if depth > 0 {
-						i++
-					}
-				}
-				innerSel := selector[innerStart:i]
-				if i < len(selector) {
-					i++ // skip )
-				}
-				innerConds := parseSimpleSelector(innerSel)
-				conditions = append(conditions, selectorCondition{
-					condType: "not",
-					inner:    innerConds,
-				})
-			} else {
-				// Other pseudo-class — skip (already read name)
-				_ = nameStart
-				if i < len(selector) && selector[i] == '(' {
-					depth := 1
-					i++
-					for i < len(selector) && depth > 0 {
-						if selector[i] == '(' {
-							depth++
-						}
-						if selector[i] == ')' {
-							depth--
-						}
-						i++
-					}
-				}
+			name := strings.ToLower(readIdent(selector, &i))
+			cond := selectorCondition{condType: "pseudo", name: name}
+			if i < len(selector) && selector[i] == '(' {
+				cond.arg = readParenGroup(selector, &i)
 			}
+			switch name {
+			case "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type":
+				cond.nth, cond.nthOK = parseNth(cond.arg)
+			}
+			conditions = append(conditions, cond)
 
 		case '*':
 			i++
 			// Universal selector, matches anything
 
 		default: // Element type selector
+			before := i
 			name := readIdent(selector, &i)
 			if name != "" {
 				conditions = append(conditions, selectorCondition{
 					condType: "element", name: name,
 				})
+			} else if i == before {
+				// readIdent made no progress on an unexpected char
+				// (e.g. a stray ')' or '('); skip it to avoid an infinite loop.
+				i++
 			}
 		}
 	}
@@ -369,47 +357,128 @@ func readIdent(s string, i *int) string {
 	return s[start:*i]
 }
 
-// parseAttrSelector parses [attr] or [attr=value] from position i.
-func parseAttrSelector(s string, i *int) (attr, val string, hasVal bool) {
-	// Read attribute name
-	start := *i
-	for *i < len(s) && s[*i] != '=' && s[*i] != ']' && s[*i] != '~' &&
-		s[*i] != '|' && s[*i] != '^' && s[*i] != '$' && s[*i] != '*' {
-		(*i)++
-	}
-	attr = strings.TrimSpace(s[start:*i])
+// attrSelector is a parsed `[...]` attribute selector.
+//
+// op is "" for a bare presence test, otherwise one of "=", "~=", "|=", "^=",
+// "$=", "*=" or "!=" ("!=" is a css-select extension, not standard CSS).
+// invalid marks selectors that css-select rejects outright — namespaced
+// attributes and malformed syntax.
+type attrSelector struct {
+	name       string
+	op         string
+	value      string
+	ignoreCase bool
+	invalid    bool
+}
 
-	if *i < len(s) && s[*i] == '=' {
-		hasVal = true
-		(*i)++ // skip =
-		val = readAttrValue(s, i)
-	} else if *i < len(s) && (s[*i] == '~' || s[*i] == '|' || s[*i] == '^' ||
-		s[*i] == '$' || s[*i] == '*') {
-		(*i)++ // skip modifier
-		if *i < len(s) && s[*i] == '=' {
-			hasVal = true
-			(*i)++ // skip =
-			val = readAttrValue(s, i)
+// parseAttrSelector parses an attribute selector body starting just after the
+// opening '[', e.g. `attr]`, `attr=value]` or `attr~="value" i]`, and advances
+// *i past the closing ']'.
+//
+// This mirrors css-what's attribute branch (lib/commonjs/parse.js), which is
+// the parser css-select — and therefore SVGO — uses.
+func parseAttrSelector(s string, i *int) attrSelector {
+	var as attrSelector
+
+	skipSelectorSpace(s, i)
+
+	// Namespace prefix. `[|attr]` means "no namespace" and is equivalent to
+	// `[attr]`. Anything else (`[ns|attr]`, `[*|attr]`) makes css-select throw
+	// "Namespaced attributes are not yet supported".
+	if *i < len(s) && s[*i] == '|' {
+		(*i)++
+	} else if strings.HasPrefix(s[*i:], "*|") {
+		*i += 2
+		as.invalid = true
+	}
+
+	as.name = readAttrName(s, i)
+	if *i < len(s) && s[*i] == '|' && (*i+1 >= len(s) || s[*i+1] != '=') {
+		(*i)++
+		as.name = readAttrName(s, i)
+		as.invalid = true
+	}
+
+	skipSelectorSpace(s, i)
+
+	// Comparison operator. An operator character not followed by '=' makes
+	// css-what throw "Expected `=`".
+	if *i < len(s) {
+		switch c := s[*i]; c {
+		case '~', '|', '^', '$', '*', '!':
+			if *i+1 < len(s) && s[*i+1] == '=' {
+				as.op = string(c) + "="
+				*i += 2
+			} else {
+				as.invalid = true
+			}
+		case '=':
+			as.op = "="
+			(*i)++
 		}
 	}
 
-	// Skip to closing ]
-	for *i < len(s) && s[*i] != ']' {
-		(*i)++
-	}
-	if *i < len(s) {
-		(*i)++ // skip ]
+	if as.op != "" {
+		skipSelectorSpace(s, i)
+		as.value = readAttrValue(s, i)
+		skipSelectorSpace(s, i)
+
+		// Optional case-sensitivity flag. `i` forces case-insensitive
+		// matching, `s` forces case-sensitive — which is already the default,
+		// because SVGO drives css-select with xmlMode: true and that disables
+		// the HTML case-insensitive attribute list. Both flags are themselves
+		// matched case-insensitively.
+		if *i < len(s) {
+			switch s[*i] {
+			case 'i', 'I':
+				as.ignoreCase = true
+				(*i)++
+				skipSelectorSpace(s, i)
+			case 's', 'S':
+				(*i)++
+				skipSelectorSpace(s, i)
+			}
+		}
 	}
 
-	return
+	if *i < len(s) && s[*i] == ']' {
+		(*i)++
+	} else {
+		// css-what: "Attribute selector didn't terminate".
+		as.invalid = true
+		for *i < len(s) && s[*i] != ']' {
+			(*i)++
+		}
+		if *i < len(s) {
+			(*i)++
+		}
+	}
+
+	return as
 }
 
-// readAttrValue reads a (possibly quoted) attribute value.
-func readAttrValue(s string, i *int) string {
-	// Skip whitespace
-	for *i < len(s) && s[*i] == ' ' {
+// readAttrName reads an attribute name inside an attribute selector, resolving
+// CSS escapes.
+func readAttrName(s string, i *int) string {
+	start := *i
+	for *i < len(s) {
+		c := s[*i]
+		if c == '\\' && *i+1 < len(s) {
+			*i += 2
+			continue
+		}
+		if isSelectorSpace(c) || c == '=' || c == ']' || c == '~' ||
+			c == '|' || c == '^' || c == '$' || c == '*' || c == '!' {
+			break
+		}
 		(*i)++
 	}
+	return unescapeCSSIdentifier(s[start:*i])
+}
+
+// readAttrValue reads a quoted or bare attribute selector value, resolving CSS
+// escapes. A bare value ends at whitespace or ']'.
+func readAttrValue(s string, i *int) string {
 	if *i >= len(s) {
 		return ""
 	}
@@ -419,9 +488,12 @@ func readAttrValue(s string, i *int) string {
 		(*i)++
 		start := *i
 		for *i < len(s) && s[*i] != quote {
+			if s[*i] == '\\' && *i+1 < len(s) {
+				(*i)++
+			}
 			(*i)++
 		}
-		val := s[start:*i]
+		val := unescapeCSSIdentifier(s[start:*i])
 		if *i < len(s) {
 			(*i)++ // skip closing quote
 		}
@@ -429,14 +501,64 @@ func readAttrValue(s string, i *int) string {
 	}
 
 	start := *i
-	for *i < len(s) && s[*i] != ']' && s[*i] != ' ' {
+	for *i < len(s) {
+		c := s[*i]
+		if c == '\\' && *i+1 < len(s) {
+			*i += 2
+			continue
+		}
+		if c == ']' || isSelectorSpace(c) {
+			break
+		}
 		(*i)++
 	}
-	return s[start:*i]
+	return unescapeCSSIdentifier(s[start:*i])
+}
+
+// isSelectorSpace reports whether c is whitespace inside selector syntax,
+// matching css-what's isWhitespace.
+func isSelectorSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
+// skipSelectorSpace advances *i past selector whitespace.
+func skipSelectorSpace(s string, i *int) {
+	for *i < len(s) && isSelectorSpace(s[*i]) {
+		(*i)++
+	}
+}
+
+// readParenGroup reads a parenthesised group starting at s[*i] == '(' and
+// returns its contents, leaving *i just past the closing parenthesis.
+func readParenGroup(s string, i *int) string {
+	(*i)++ // skip (
+	start := *i
+	depth := 1
+	for *i < len(s) && depth > 0 {
+		switch s[*i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth > 0 {
+			(*i)++
+		}
+	}
+	arg := s[start:*i]
+	if *i < len(s) {
+		(*i)++ // skip )
+	}
+	return arg
 }
 
 // matchCondition checks if an element matches a single condition.
-func matchCondition(elem *svgast.Element, cond selectorCondition) bool {
+func matchCondition(elem *svgast.Element, cond selectorCondition, ctx *matchCtx) bool {
+	if cond.invalid {
+		// css-select throws here, which aborts the whole selector.
+		ctx.err = true
+		return false
+	}
 	switch cond.condType {
 	case "element":
 		return elem.Name == cond.name
@@ -455,29 +577,126 @@ func matchCondition(elem *svgast.Element, cond selectorCondition) bool {
 	case "attr":
 		return elem.Attributes.Has(cond.name)
 	case "attr-eq":
-		val, ok := elem.Attributes.Get(cond.name)
-		return ok && val == cond.value
-	case "not":
-		// :not() — match if inner conditions do NOT all match
-		for _, inner := range cond.inner {
-			if !matchCondition(elem, inner) {
-				return true
-			}
-		}
-		return false
+		return matchAttrOp(elem, cond)
+	case "pseudo":
+		return matchPseudo(elem, cond, ctx)
 	}
 	return false
 }
 
+// matchAttrOp evaluates an attribute selector that carries a comparison
+// operator, mirroring css-select's attributeRules (lib/attributes.js).
+//
+// SVGO drives css-select with xmlMode: true (lib/xast.js), which disables
+// css-select's HTML case-insensitive attribute list, so matching is always
+// case-sensitive unless the selector carries an explicit `i` flag.
+func matchAttrOp(elem *svgast.Element, cond selectorCondition) bool {
+	attr, ok := elem.Attributes.Get(cond.name)
+	value := cond.value
+
+	if cond.ignoreCase {
+		attr = strings.ToLower(attr)
+		value = strings.ToLower(value)
+	}
+
+	switch cond.op {
+	case "=": // exact match
+		return ok && attr == value
+
+	case "~=": // membership in a whitespace-separated word list
+		// css-select compiles this to `(?:^|\s)value(?:$|\s)` and short-
+		// circuits to "never matches" when the value itself has whitespace.
+		// Note it does NOT reject an empty value: `[a~=""]` matches an empty
+		// or all-whitespace attribute.
+		if !ok || strings.ContainsFunc(value, isCSSSpaceRune) {
+			return false
+		}
+		return containsWord(attr, value)
+
+	case "|=": // exactly value, or value followed by "-"
+		return ok && strings.HasPrefix(attr, value) &&
+			(len(attr) == len(value) || attr[len(value)] == '-')
+
+	case "^=": // prefix; an empty value never matches
+		return ok && value != "" && strings.HasPrefix(attr, value)
+
+	case "$=": // suffix; an empty value never matches
+		return ok && value != "" && strings.HasSuffix(attr, value)
+
+	case "*=": // substring; an empty value never matches
+		return ok && value != "" && strings.Contains(attr, value)
+
+	case "!=": // css-select extension: everything except an exact match
+		if value == "" {
+			return attr != ""
+		}
+		return attr != value
+	}
+
+	return false
+}
+
+// containsWord reports whether value occurs in attr delimited by whitespace or
+// string boundaries. It reproduces css-select's `(?:^|\s)value(?:$|\s)` regex,
+// including the empty-value case, where an empty or all-whitespace attr
+// matches.
+func containsWord(attr, value string) bool {
+	if len(attr) < len(value) {
+		return false
+	}
+	for p := 0; p+len(value) <= len(attr); p++ {
+		if attr[p:p+len(value)] != value {
+			continue
+		}
+		if p > 0 {
+			r, _ := utf8.DecodeLastRuneInString(attr[:p])
+			if !isCSSSpaceRune(r) {
+				continue
+			}
+		}
+		if end := p + len(value); end < len(attr) {
+			r, _ := utf8.DecodeRuneInString(attr[end:])
+			if !isCSSSpaceRune(r) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isCSSSpaceRune reports whether r is whitespace as JavaScript's `\s` character
+// class defines it, which is what css-select's `~=` regex matches against.
+func isCSSSpaceRune(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', ' ',
+		0x00a0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200a
+}
+
 // QuerySelectorAll finds all descendant elements matching a selector.
+// Selectors css-select would throw on yield no matches.
 func QuerySelectorAll(node svgast.Node, selector string, parents map[svgast.Node]svgast.Parent) []*svgast.Element {
-	var results []*svgast.Element
+	results, _ := QuerySelectorAllErr(node, selector, parents)
+	return results
+}
+
+// QuerySelectorAllErr is QuerySelectorAll, additionally reporting whether the
+// selector could be fully evaluated. SVGO wraps its querySelectorAll call in a
+// try/catch and skips the rule when css-select throws; ok mirrors that signal.
+func QuerySelectorAllErr(node svgast.Node, selector string, parents map[svgast.Node]svgast.Parent) (results []*svgast.Element, ok bool) {
+	ctx := &matchCtx{parents: parents}
 	walkElements(node, func(elem *svgast.Element) {
-		if Matches(elem, selector, parents) {
+		if matchesSelectorList(elem, selector, ctx) {
 			results = append(results, elem)
 		}
 	})
-	return results
+	if ctx.err {
+		return nil, false
+	}
+	return results, true
 }
 
 // walkElements walks all element nodes under a node.

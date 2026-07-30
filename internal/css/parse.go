@@ -105,14 +105,15 @@ func ParseStylesheet(cssText string, dynamic bool) []StylesheetRule {
 					continue
 				}
 
-				hasPseudo := containsPseudoClass(sel)
-				// Strip pseudo-classes from selector for matching
-				cleanSel := StripPseudoClasses(sel)
-
+				// inlineStyles keeps the pseudo-classes css-select can
+				// evaluate; computeStyle strips every pseudo-class and treats
+				// the rule as dynamic instead.
 				rules = append(rules, StylesheetRule{
 					Specificity:      CalculateSpecificity(sel), // use original for specificity
-					Dynamic:          hasPseudo || dynamic,
-					Selector:         cleanSel,
+					Dynamic:          containsPseudoClass(sel) || dynamic,
+					StyleDynamic:     ContainsAnyPseudoClass(sel) || dynamic,
+					Selector:         StripPseudoClasses(sel),
+					StyleSelector:    StripAllPseudoClasses(sel),
 					OriginalSelector: sel,
 					Declarations:     declarations,
 				})
@@ -224,13 +225,12 @@ func parseAtRuleBlock(p *css.Parser, dynamic bool) []StylesheetRule {
 				if sel == "" {
 					continue
 				}
-				hasPseudo := containsPseudoClass(sel)
-				cleanSel := StripPseudoClasses(sel)
-
 				rules = append(rules, StylesheetRule{
 					Specificity:      CalculateSpecificity(sel),
-					Dynamic:          hasPseudo || dynamic,
-					Selector:         cleanSel,
+					Dynamic:          containsPseudoClass(sel) || dynamic,
+					StyleDynamic:     ContainsAnyPseudoClass(sel) || dynamic,
+					Selector:         StripPseudoClasses(sel),
+					StyleSelector:    StripAllPseudoClasses(sel),
 					OriginalSelector: sel,
 					Declarations:     declarations,
 				})

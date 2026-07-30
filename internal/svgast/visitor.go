@@ -45,6 +45,67 @@ type VisitorCallbacks struct {
 //     attached to its parent (enables safe removal during traversal)
 //   - exit callbacks are always called
 func Visit(node Node, visitor *Visitor, parent Parent) {
+	var live *liveChildren
+	if parent != nil {
+		live = &liveChildren{parent: parent}
+	}
+	visitNode(node, visitor, parent, live)
+}
+
+// liveChildren answers "is this node still one of the parent's children" in
+// O(1) instead of scanning the sibling list on every child. The scan made a
+// flat document with k children cost O(k^2) per plugin.
+//
+// The traversal walks a snapshot of the children in order, and every mutation
+// plugins perform through DetachNodeFromParent (or an equivalent filter)
+// preserves the relative order of the survivors. So the node being asked about
+// is normally sitting at cursor: a survivor advances the cursor, a detached
+// node leaves it pointing at whatever shifted into its place. Anything the
+// cursor cannot model — an insertion, a reorder — flips the tracker into
+// degraded mode, where it falls back to a linear scan.
+type liveChildren struct {
+	parent   Parent
+	cursor   int // index in the live slice where the next surviving child must sit
+	expected int // len(parent.GetChildren()) at the previous query
+	primed   bool
+	degraded bool
+}
+
+// contains reports whether node is currently among the parent's children.
+func (l *liveChildren) contains(node Node) bool {
+	if l == nil || l.parent == nil {
+		return false
+	}
+	children := l.parent.GetChildren()
+	if !l.primed {
+		l.primed = true
+		l.expected = len(children)
+	}
+	if !l.degraded && len(children) > l.expected {
+		// Children were inserted; the cursor no longer tracks the snapshot.
+		l.degraded = true
+	}
+	if l.degraded {
+		l.expected = len(children)
+		return slices.Contains(children, node)
+	}
+	if l.cursor < len(children) && children[l.cursor] == node {
+		l.cursor++
+		l.expected = len(children)
+		return true
+	}
+	l.expected = len(children)
+	// Not where it was expected. Normally that means the enter callback
+	// detached it; confirm with one scan and drop to the scanning path if the
+	// children turn out to have been rearranged instead.
+	if slices.Contains(children, node) {
+		l.degraded = true
+		return true
+	}
+	return false
+}
+
+func visitNode(node Node, visitor *Visitor, parent Parent, attached *liveChildren) {
 	callbacks := getCallbacks(node, visitor)
 
 	// Enter phase
@@ -65,17 +126,19 @@ func Visit(node Node, visitor *Visitor, parent Parent) {
 		// Copy children slice to handle modifications during iteration
 		children := make([]Node, len(n.Children))
 		copy(children, n.Children)
+		live := &liveChildren{parent: n}
 		for _, child := range children {
-			Visit(child, visitor, n)
+			visitNode(child, visitor, n, live)
 		}
 
 	case *Element:
 		// Only visit children if element is still attached to parent
-		if parent != nil && nodeInChildren(node, parent.GetChildren()) {
+		if parent != nil && attached.contains(node) {
 			children := make([]Node, len(n.Children))
 			copy(children, n.Children)
+			live := &liveChildren{parent: n}
 			for _, child := range children {
-				Visit(child, visitor, n)
+				visitNode(child, visitor, n, live)
 			}
 		}
 	}
@@ -106,11 +169,6 @@ func getCallbacks(node Node, visitor *Visitor) *VisitorCallbacks {
 	default:
 		return nil
 	}
-}
-
-// nodeInChildren checks if a node is still in the parent's children list.
-func nodeInChildren(node Node, children []Node) bool {
-	return slices.Contains(children, node)
 }
 
 // DetachNodeFromParent removes a node from its parent's children list.

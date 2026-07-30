@@ -47,6 +47,7 @@ var (
 // stringifyState holds mutable state during stringification.
 type stringifyState struct {
 	indent      string   // the indentation string per level
+	indentCache string   // lazily grown repetitions of indent
 	textContext *Element // non-nil when inside a text element
 	indentLevel int
 	eol         string // resolved EOL string
@@ -118,7 +119,9 @@ func StringifySvg(root *Root, opts *StringifyOptions) string {
 		st.textEnd += eol
 	}
 
-	svg := stringifyChildren(root, opts, st)
+	var b strings.Builder
+	stringifyChildren(&b, root, opts, st)
+	svg := b.String()
 
 	if opts.FinalNewline && len(svg) > 0 && !strings.HasSuffix(svg, "\n") {
 		svg += eol
@@ -127,119 +130,150 @@ func StringifySvg(root *Root, opts *StringifyOptions) string {
 	return svg
 }
 
-// stringifyChildren stringifies all children of a parent node.
-func stringifyChildren(parent Parent, opts *StringifyOptions, st *stringifyState) string {
-	var b strings.Builder
+// stringifyChildren appends all children of a parent node to b.
+func stringifyChildren(b *strings.Builder, parent Parent, opts *StringifyOptions, st *stringifyState) {
 	st.indentLevel++
 	for _, child := range parent.GetChildren() {
 		switch n := child.(type) {
 		case *Element:
-			b.WriteString(stringifyElement(n, opts, st))
+			stringifyElement(b, n, opts, st)
 		case *Text:
-			b.WriteString(stringifyText(n, opts, st))
+			stringifyText(b, n, opts, st)
 		case *Doctype:
-			b.WriteString(stringifyDoctype(n, st))
+			stringifyDoctype(b, n, st)
 		case *Instruction:
-			b.WriteString(stringifyInstruction(n, st))
+			stringifyInstruction(b, n, st)
 		case *Comment:
-			b.WriteString(stringifyComment(n, st))
+			stringifyComment(b, n, st)
 		case *Cdata:
-			b.WriteString(stringifyCdata(n, opts, st))
+			stringifyCdata(b, n, opts, st)
 		}
 	}
 	st.indentLevel--
-	return b.String()
 }
 
-// createIndent returns the indentation string for the current level.
-func createIndent(opts *StringifyOptions, st *stringifyState) string {
-	if opts.Pretty && st.textContext == nil {
-		return strings.Repeat(st.indent, st.indentLevel-1)
+// writeIndent appends the indentation for the current level to b. The repeated
+// indent is grown once and sliced, instead of a strings.Repeat per node.
+func writeIndent(b *strings.Builder, opts *StringifyOptions, st *stringifyState) {
+	if !opts.Pretty || st.textContext != nil {
+		return
 	}
-	return ""
+	n := st.indentLevel - 1
+	if n <= 0 {
+		return
+	}
+	need := n * len(st.indent)
+	for len(st.indentCache) < need {
+		st.indentCache += st.indent
+	}
+	b.WriteString(st.indentCache[:need])
 }
 
-func stringifyDoctype(n *Doctype, st *stringifyState) string {
-	return "<!DOCTYPE" + n.Data.Doctype + st.doctypeEnd
+func stringifyDoctype(b *strings.Builder, n *Doctype, st *stringifyState) {
+	b.WriteString("<!DOCTYPE")
+	b.WriteString(n.Data.Doctype)
+	b.WriteString(st.doctypeEnd)
 }
 
-func stringifyInstruction(n *Instruction, st *stringifyState) string {
-	return "<?" + n.Name + " " + n.Value + st.procInstEnd
+func stringifyInstruction(b *strings.Builder, n *Instruction, st *stringifyState) {
+	b.WriteString("<?")
+	b.WriteString(n.Name)
+	b.WriteByte(' ')
+	b.WriteString(n.Value)
+	b.WriteString(st.procInstEnd)
 }
 
-func stringifyComment(n *Comment, st *stringifyState) string {
-	return "<!--" + n.Value + st.commentEnd
+func stringifyComment(b *strings.Builder, n *Comment, st *stringifyState) {
+	b.WriteString("<!--")
+	b.WriteString(n.Value)
+	b.WriteString(st.commentEnd)
 }
 
-func stringifyCdata(n *Cdata, opts *StringifyOptions, st *stringifyState) string {
-	return createIndent(opts, st) + "<![CDATA[" + n.Value + st.cdataEnd
+func stringifyCdata(b *strings.Builder, n *Cdata, opts *StringifyOptions, st *stringifyState) {
+	writeIndent(b, opts, st)
+	b.WriteString("<![CDATA[")
+	b.WriteString(n.Value)
+	b.WriteString(st.cdataEnd)
 }
 
-func stringifyElement(n *Element, opts *StringifyOptions, st *stringifyState) string {
+func stringifyElement(b *strings.Builder, n *Element, opts *StringifyOptions, st *stringifyState) {
 	// Empty element
 	if len(n.Children) == 0 {
+		writeIndent(b, opts, st)
+		b.WriteByte('<')
+		b.WriteString(n.Name)
+		stringifyAttributes(b, n)
 		if opts.UseShortTags {
-			return createIndent(opts, st) +
-				"<" + n.Name + stringifyAttributes(n) +
-				st.tagShortEnd
+			b.WriteString(st.tagShortEnd)
+			return
 		}
-		return createIndent(opts, st) +
-			"<" + n.Name + stringifyAttributes(n) +
-			st.tagOpenEnd +
-			"</" + n.Name + st.tagCloseEnd
+		b.WriteString(st.tagOpenEnd)
+		b.WriteString("</")
+		b.WriteString(n.Name)
+		b.WriteString(st.tagCloseEnd)
+		return
 	}
 
 	// Non-empty element
 	tagOpenEnd := st.tagOpenEnd
 	tagCloseEnd := st.tagCloseEnd
-	openIndent := createIndent(opts, st)
-	closeIndent := createIndent(opts, st)
+	indentOpen := true
+	indentClose := true
+	enterTextContext := false
 
 	if st.textContext != nil {
 		// Inside a text element — use bare tags, no indentation
 		tagOpenEnd = ">"
 		tagCloseEnd = ">"
-		openIndent = ""
+		indentOpen = false
 	} else if IsTextElem(n.Name) {
 		// This IS a text element — no EOL after open/before close
 		tagOpenEnd = ">"
-		closeIndent = ""
-		st.textContext = n
+		indentClose = false
+		enterTextContext = true
 	}
 
-	children := stringifyChildren(n, opts, st)
+	// The open tag is still indented at the outer level, so the indent must be
+	// emitted before this element becomes the text context.
+	if indentOpen {
+		writeIndent(b, opts, st)
+	}
+	if enterTextContext {
+		st.textContext = n
+	}
+	b.WriteByte('<')
+	b.WriteString(n.Name)
+	stringifyAttributes(b, n)
+	b.WriteString(tagOpenEnd)
+
+	stringifyChildren(b, n, opts, st)
 
 	if st.textContext == n {
 		st.textContext = nil
 	}
 
-	// Use the base tagCloseStart/End for close tag
-	return openIndent +
-		"<" + n.Name + stringifyAttributes(n) + tagOpenEnd +
-		children +
-		closeIndent + "</" + n.Name + tagCloseEnd
+	if indentClose {
+		writeIndent(b, opts, st)
+	}
+	b.WriteString("</")
+	b.WriteString(n.Name)
+	b.WriteString(tagCloseEnd)
 }
 
-func stringifyAttributes(n *Element) string {
-	if n.Attributes.Len() == 0 {
-		return ""
-	}
-	var b strings.Builder
+func stringifyAttributes(b *strings.Builder, n *Element) {
 	for _, attr := range n.Attributes.Entries() {
 		b.WriteByte(' ')
 		b.WriteString(attr.Name)
 		if attr.Value != UndefinedAttrValue {
 			b.WriteString("=\"")
-			b.WriteString(encodeAttrValue(attr.Value))
+			writeEncodedAttrValue(b, attr.Value)
 			b.WriteByte('"')
 		}
 	}
-	return b.String()
 }
 
-// encodeTextValue encodes text content entities: & ' " > <
-func encodeTextValue(s string) string {
-	var b strings.Builder
+// writeEncodedTextValue appends text content with entities encoded: & ' " > <
+func writeEncodedTextValue(b *strings.Builder, s string) {
 	for i := range len(s) {
 		if ent, ok := textEntities[s[i]]; ok {
 			b.WriteString(ent)
@@ -247,12 +281,10 @@ func encodeTextValue(s string) string {
 			b.WriteByte(s[i])
 		}
 	}
-	return b.String()
 }
 
-// encodeAttrValue encodes attribute value entities: & " > <
-func encodeAttrValue(s string) string {
-	var b strings.Builder
+// writeEncodedAttrValue appends an attribute value with entities encoded: & " > <
+func writeEncodedAttrValue(b *strings.Builder, s string) {
 	for i := range len(s) {
 		if ent, ok := attrEntities[s[i]]; ok {
 			b.WriteString(ent)
@@ -260,14 +292,12 @@ func encodeAttrValue(s string) string {
 			b.WriteByte(s[i])
 		}
 	}
-	return b.String()
 }
 
-func stringifyText(n *Text, opts *StringifyOptions, st *stringifyState) string {
-	indent := createIndent(opts, st)
-	textEnd := ""
+func stringifyText(b *strings.Builder, n *Text, opts *StringifyOptions, st *stringifyState) {
+	writeIndent(b, opts, st)
+	writeEncodedTextValue(b, n.Value)
 	if st.textContext == nil {
-		textEnd = st.textEnd
+		b.WriteString(st.textEnd)
 	}
-	return indent + encodeTextValue(n.Value) + textEnd
 }

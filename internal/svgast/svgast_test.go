@@ -4,6 +4,7 @@
 package svgast
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -454,5 +455,93 @@ func TestDetachNodeFromParent(t *testing.T) {
 	}
 	if parent.Children[0] != child1 || parent.Children[1] != child3 {
 		t.Error("wrong children after detach")
+	}
+}
+
+// --- Parser limit tests ---
+
+func TestParseSvg_MaxNestingDepth(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg">`)
+	for range MaxNestingDepth + 8 {
+		b.WriteString("<g>")
+	}
+	for range MaxNestingDepth + 8 {
+		b.WriteString("</g>")
+	}
+	b.WriteString("</svg>")
+
+	root, err := ParseSvg(b.String(), "")
+	if err == nil {
+		t.Fatal("expected an error for over-deep nesting, got nil")
+	}
+	if root != nil {
+		t.Error("expected a nil root alongside the error")
+	}
+	if !strings.Contains(err.Error(), "element nesting exceeds") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseSvg_DepthWithinLimitStillParses(t *testing.T) {
+	const depth = 512
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg">`)
+	for range depth {
+		b.WriteString("<g>")
+	}
+	for range depth {
+		b.WriteString("</g>")
+	}
+	b.WriteString("</svg>")
+
+	if _, err := ParseSvg(b.String(), ""); err != nil {
+		t.Fatalf("depth %d should parse: %v", depth, err)
+	}
+}
+
+func TestParseSvg_MaxNodeCount(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg">`)
+	for range MaxNodeCount + 2 {
+		b.WriteString("<g/>")
+	}
+	b.WriteString("</svg>")
+
+	if _, err := ParseSvg(b.String(), ""); err == nil ||
+		!strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected a node-count error, got %v", err)
+	}
+}
+
+// --- liveChildren traversal tests ---
+
+func TestVisit_DetachSiblingsDuringTraversal(t *testing.T) {
+	root, err := ParseSvg(
+		`<svg xmlns="http://www.w3.org/2000/svg">`+
+			`<g id="a"><rect id="a1"/></g>`+
+			`<g id="b"><rect id="b1"/></g>`+
+			`<g id="c"><rect id="c1"/></g>`+
+			`</svg>`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var seen []string
+	Visit(root, &Visitor{Element: &VisitorCallbacks{
+		Enter: func(node Node, parent Parent) error {
+			elem := node.(*Element)
+			id, _ := elem.Attributes.Get("id")
+			seen = append(seen, id)
+			if id == "a" || id == "b" {
+				DetachNodeFromParent(elem, parent)
+			}
+			return nil
+		},
+	}}, nil)
+
+	want := []string{"", "a", "b", "c", "c1"} // <svg> has no id
+	if !slices.Equal(seen, want) {
+		t.Errorf("visited %v, want %v", seen, want)
 	}
 }
